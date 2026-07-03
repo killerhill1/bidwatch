@@ -1,56 +1,48 @@
 """
 BidWatch — Courtman Enterprises LLC
-v7: verified town URLs from uspublicworks.com directory
+v8: clean rewrite — universal row search, stealth headers, verified URLs, expanded keywords
 """
 
-# ── Logging first ─────────────────────────────────────────────────────────────
 import logging, sys
-
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 log = logging.getLogger("bidwatch")
-log.info("BidWatch v7 starting")
+log.info("BidWatch v8 starting")
 
-# ── Safe lxml fallback ────────────────────────────────────────────────────────
-try:
-    import lxml
-    HTML_PARSER = "lxml"
-    log.info("Using lxml parser")
-except ImportError:
-    HTML_PARSER = "html.parser"
-    log.info("Using html.parser")
-
-# ── Imports ───────────────────────────────────────────────────────────────────
 from flask import Flask, jsonify, render_template_string, request
-import requests
+import requests, json, os, re, threading, schedule, time
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import json, os, re, threading, schedule, time
 from datetime import datetime
 from pathlib import Path
+import random
 
 log.info("Imports OK")
 
 # ── Storage ───────────────────────────────────────────────────────────────────
-DATA_DIR = Path("/tmp/bidwatch")
+DATA_DIR  = Path("/tmp/bidwatch")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = DATA_DIR / "bids.json"
 SEEN_FILE = DATA_DIR / "seen.json"
 lock      = threading.Lock()
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Keywords — expanded ───────────────────────────────────────────────────────
 ROOFING_KEYWORDS = [
-    "roof", "roofing", "slate", "shingle", "membrane", "flashing",
-    "gutter", "copper", "waterproof", "tpo", "epdm", "flat roof",
-    "sheet metal", "soffit", "fascia", "historic roof", "re-roof"
+    "roof", "roofing", "re-roof", "reroof",
+    "slate", "shingle", "shingles",
+    "membrane", "tpo", "epdm", "modified bitumen",
+    "flashing", "sheet metal",
+    "gutter", "gutters", "fascia", "soffit",
+    "copper", "waterproof", "waterproofing",
+    "flat roof", "low slope", "standing seam",
+    "historic roof", "restoration"
 ]
 
-# Rotate user agents to avoid 403 blocks
+# ── User-Agent rotation ───────────────────────────────────────────────────────
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -58,14 +50,10 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
-_ua_index = 0
 
 def get_headers(referer=None):
-    global _ua_index
-    ua = USER_AGENTS[_ua_index % len(USER_AGENTS)]
-    _ua_index += 1
-    headers = {
-        "User-Agent": ua,
+    h = {
+        "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
@@ -74,55 +62,73 @@ def get_headers(referer=None):
         "Cache-Control": "max-age=0",
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-Site": "same-origin" if referer else "none",
         "Sec-Fetch-User": "?1",
     }
     if referer:
-        headers["Referer"] = referer
-    return headers
+        h["Referer"] = referer
+    return h
 
-# Verified URLs from uspublicworks.com CT directory + direct search
+# ── Verified town URLs ────────────────────────────────────────────────────────
 TOWNS = [
     # Confirmed working
-    ("Meriden",       "https://www.meridenct.gov/business/bids-rfps/",                "City of Meriden"),
-    ("Enfield",       "https://www.enfield-ct.gov/Bids.aspx",                         "Town of Enfield"),
-    ("Vernon",        "https://www.vernon-ct.gov/government/bids-and-contracts",      "Town of Vernon"),
-    ("Bloomfield",    "https://www.bloomfieldct.gov/Bids.aspx",                       "Town of Bloomfield"),
-    ("Middletown",    "https://www.middletownct.gov/Bids.aspx",                       "City of Middletown"),
-    ("Bristol",       "https://www.bristolct.gov/bids.aspx",                          "City of Bristol"),
-    # Verified from search
-    ("Newington",     "https://www.newingtonct.gov/Bids.aspx",                        "Town of Newington"),
-    ("Windsor",       "https://www.windsorct.gov/bids.aspx",                          "Town of Windsor"),
-    ("Wethersfield",  "https://www.wethersfieldct.gov/332/Current-Open-Bids",         "Town of Wethersfield"),
-    ("New Britain",   "https://www.newbritainct.gov/services/purchasing/bidshtm",     "City of New Britain"),
+    ("Meriden",       "https://www.meridenct.gov/business/bids-rfps/",                       "City of Meriden"),
+    ("Enfield",       "https://www.enfield-ct.gov/Bids.aspx",                                "Town of Enfield"),
+    ("Vernon",        "https://www.vernon-ct.gov/government/bids-and-contracts",             "Town of Vernon"),
+    ("Bloomfield",    "https://www.bloomfieldct.gov/Bids.aspx",                              "Town of Bloomfield"),
+    ("Middletown",    "https://www.middletownct.gov/Bids.aspx",                              "City of Middletown"),
+    ("Bristol",       "https://www.bristolct.gov/bids.aspx",                                 "City of Bristol"),
+    ("Newington",     "https://www.newingtonct.gov/Bids.aspx",                               "Town of Newington"),
+    ("Windsor",       "https://www.windsorct.gov/bids.aspx",                                 "Town of Windsor"),
+    ("Wethersfield",  "https://www.wethersfieldct.gov/332/Current-Open-Bids",               "Town of Wethersfield"),
+    ("New Britain",   "https://www.newbritainct.gov/services/purchasing/bidshtm",            "City of New Britain"),
     ("Southington",   "https://www.southingtonct.gov/departments/engineering_department/bid_invitations.php", "Town of Southington"),
-    ("Glastonbury",   "https://www.glastonburyct.gov/bids.aspx",                      "Town of Glastonbury"),
-    ("Farmington",    "https://www.farmington-ct.org/bids.aspx",                      "Town of Farmington"),
-    ("Tolland",       "https://www.tolland.org/Bids.aspx",                            "Town of Tolland"),
-    ("Windsor Locks", "https://www.windsorlocksct.org/Bids.aspx",                     "Town of Windsor Locks"),
-    ("Berlin",        "https://www.berlinct.gov/Bids.aspx",                           "Town of Berlin"),
-    ("East Hartford", "https://www.easthartfordct.gov/Bids.aspx",                     "Town of East Hartford"),
-    ("Manchester",    "https://www.manchesterct.gov/Bids.aspx",                       "Town of Manchester"),
-    ("Wallingford",   "https://www.wallingford.ct.us/Bids.aspx",                      "Town of Wallingford"),
-    ("Granby",        "https://www.granby-ct.gov/Bids.aspx",                          "Town of Granby"),
-    ("Cromwell",      "https://www.cromwellct.com/bids",                              "Town of Cromwell"),
-    ("Canton",        "https://www.townofcantonct.org/rfp-contracts",                 "Town of Canton"),
+    ("Granby",        "https://www.granby-ct.gov/Bids.aspx",                                 "Town of Granby"),
+    ("Canton",        "https://www.townofcantonct.org/active-bids/",                          "Town of Canton"),
+    ("Cromwell",      "https://www.cromwellct.com/bids",                                      "Town of Cromwell"),
+    # User-verified URLs
+    ("Farmington",    "https://www.farmington-ct.org/departments/finance-purchasing/purchasing/bids/-sortn-RFPStarting/-sortd-desc#RFPStarting_550_1794_1647", "Town of Farmington"),
+    ("Tolland",       "https://www.tollandct.gov/bids",                                      "Town of Tolland"),
+    ("East Hartford", "https://www.easthartfordct.gov/bids",                                 "Town of East Hartford"),
+    ("Manchester",    "https://www.manchesterct.gov/Government/Departments/Purchasing/BIDS", "Town of Manchester"),
+    ("Windsor Locks", "https://windsorlocksct.org/bidding-opportunities/",                   "Town of Windsor Locks"),
+    ("Berlin",        "https://www.berlinct.gov/topic/subtopic.php?topicid=412&structureid=123", "Town of Berlin"),
+    # Glastonbury + Wallingford use BonfireHub portal — register at bonfirehub.com for email alerts
+    # ("Glastonbury", "https://glastonburyct.bonfirehub.com/portal/?tab=openOpportunities", "Town of Glastonbury"),
+    # ("Wallingford", "https://wallingford.bonfirehub.com/portal/?tab=openOpportunities",   "Town of Wallingford"),
 ]
 
-# ── HTTP session ──────────────────────────────────────────────────────────────
-def make_session():
-    s = requests.Session()
-    retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
-    s.mount("http://",  HTTPAdapter(max_retries=retry))
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    return s
+# ── Junk phrases to skip ──────────────────────────────────────────────────────
+JUNK = [
+    "sign in", "create account", "printer friendly", "email page",
+    "site map", "translate", "my account", "facebook", "twitter",
+    "pinterest", "linkedin", "instagram", "subscribe", "copyright",
+    "powered by", "skip to", "delicious", "blogger", "youtube",
+]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def is_roofing(text):
-    return any(kw in text.lower() for kw in ROOFING_KEYWORDS)
+    t = text.lower()
+    return any(kw in t for kw in ROOFING_KEYWORDS)
+
+def is_junk(text):
+    t = text.lower()
+    if any(j in t for j in JUNK):
+        return True
+    words = t.split()
+    if len(words) > 8 and len(set(words)) < len(words) * 0.5:
+        return True
+    return False
 
 def clean(text):
     return re.sub(r'\s+', ' ', text or "").strip()
+
+def make_session():
+    s = requests.Session()
+    r = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    s.mount("http://",  HTTPAdapter(max_retries=r))
+    s.mount("https://", HTTPAdapter(max_retries=r))
+    return s
 
 def load_bids():
     with lock:
@@ -161,122 +167,29 @@ def save_seen(seen):
             log.error(f"save_seen: {e}")
 
 # ── Town scraper ──────────────────────────────────────────────────────────────
-# ── CT Source scraper ─────────────────────────────────────────────────────────
-def scrape_ctsource():
-    """
-    Search BizNet for roofing bids by scanning every cell in every row
-    for roofing keywords — no fixed column index assumptions.
-    """
-    bids = []
-    seen_ids = set()
-    session = make_session()
-
-    for kw in ["roofing", "roof", "slate", "shingle"]:
-        try:
-            r = session.get(
-                "https://www.biznet.ct.gov/SCP_Search/BidResults.aspx",
-                params={"TN": kw, "CT": "B"},
-                headers=get_headers(referer="https://www.biznet.ct.gov/SCP_Search/Default.aspx"), timeout=25
-            )
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, HTML_PARSER)
-            table = soup.find("table")
-            if not table:
-                log.warning(f"CT Source '{kw}': no table in response")
-                continue
-
-            for row in table.find_all("tr")[1:]:
-                cols = row.find_all("td")
-                if not cols:
-                    continue
-
-                # Search every cell for roofing keyword
-                title = ""
-                link  = "https://portal.ct.gov/DAS/CTSource/BidBoard"
-                org   = ""
-                deadline = ""
-
-                for i, col in enumerate(cols):
-                    text = clean(col.get_text())
-                    if not title and len(text) > 10 and is_roofing(text):
-                        title = text[:200]
-                        a = col.find("a")
-                        if a and a.get("href"):
-                            href = a["href"]
-                            link = href if href.startswith("http") else "https://www.biznet.ct.gov" + href
-
-                # If we found a roofing title, grab org + deadline from other cols
-                if title:
-                    org      = clean(cols[2].get_text()) if len(cols) > 2 else "CT Agency"
-                    deadline = clean(cols[3].get_text()) if len(cols) > 3 else ""
-                    bid_id   = f"ct_{abs(hash(title + org))}"
-                    if bid_id not in seen_ids:
-                        seen_ids.add(bid_id)
-                        bids.append({
-                            "id": bid_id, "title": title, "org": org,
-                            "source": "CT Source", "deadline": deadline,
-                            "value": None, "link": link, "status": "new",
-                            "found": datetime.now().isoformat()
-                        })
-
-        except Exception as e:
-            log.warning(f"BizNet ({kw}): {e}")
-
-    log.info(f"CT Source: {len(bids)} roofing bids")
-    return bids
-
-JUNK_PHRASES = [
-    "sign in", "create account", "website sign in", "printer friendly",
-    "email page", "contact us", "site map", "translate page",
-    "my account", "facebook", "twitter", "pinterest", "linkedin",
-    "rss", "notifications", "read on", "subscribe", "copyright",
-    "all rights reserved", "powered by", "skip to", "main menu",
-    "home page", "search", "parade", "postponed", "delicious", "blogger",
-]
-
-def is_junk(text):
-    t = text.lower()
-    # Too many words that suggest navigation/footer
-    if any(phrase in t for phrase in JUNK_PHRASES):
-        return True
-    # Repeated words suggest nav text being concatenated
-    words = t.split()
-    if len(words) > 3 and len(set(words)) < len(words) * 0.6:
-        return True
-    return False
-
 def scrape_town(name, url, org):
-    bids = []
+    bids     = []
     seen_ids = set()
-    session = make_session()
+    session  = make_session()
+    from urllib.parse import urlparse
+    parsed   = urlparse(url)
+    homepage = f"{parsed.scheme}://{parsed.netloc}"
+
     try:
-        # Build referer from the town homepage to look like real navigation
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        homepage = f"{parsed.scheme}://{parsed.netloc}"
         r = session.get(url, headers=get_headers(referer=homepage), timeout=15)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, HTML_PARSER)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        # Remove nav, footer, header, sidebar before scanning
-        for tag in soup.find_all(["nav", "footer", "header", "aside",
-                                   "script", "style", "noscript"]):
+        # Strip chrome
+        for tag in soup.find_all(["nav","footer","header","aside","script","style","noscript"]):
+            tag.decompose()
+        for tag in soup.find_all(True, class_=re.compile(r"nav|menu|footer|header|sidebar|social|breadcrumb|banner|cookie|alert", re.I)):
             tag.decompose()
 
-        # Also remove common nav class/id patterns
-        for tag in soup.find_all(class_=re.compile(
-                r"nav|menu|footer|header|sidebar|social|breadcrumb|banner|alert|news",
-                re.I)):
-            tag.decompose()
-        for tag in soup.find_all(id=re.compile(
-                r"nav|menu|footer|header|sidebar|social|breadcrumb|banner|alert|news",
-                re.I)):
-            tag.decompose()
-
-        # Now scan only links — actual bids almost always have a clickable link
+        # Universal row search — check every <a> tag for roofing keywords
         for a in soup.find_all("a", href=True):
             text = clean(a.get_text())
-            if len(text) < 10 or len(text) > 200:
+            if len(text) < 8 or len(text) > 250:
                 continue
             if not is_roofing(text):
                 continue
@@ -287,9 +200,7 @@ def scrape_town(name, url, org):
             if href.startswith("http"):
                 link = href
             elif href.startswith("/"):
-                from urllib.parse import urlparse
-                base = urlparse(url)
-                link = f"{base.scheme}://{base.netloc}{href}"
+                link = f"{homepage}{href}"
             else:
                 link = url
 
@@ -297,33 +208,35 @@ def scrape_town(name, url, org):
             if bid_id in seen_ids:
                 continue
             seen_ids.add(bid_id)
-
             bids.append({
                 "id": bid_id, "title": text[:200], "org": org,
                 "source": "Town", "deadline": "", "value": None,
-                "link": link, "status": "new", "found": datetime.now().isoformat()
+                "link": link, "status": "new",
+                "found": datetime.now().isoformat()
             })
 
-        if bids:
-            log.info(f"{name}: {len(bids)} bids")
-        else:
-            log.info(f"{name}: no roofing bids found")
+        log.info(f"{name}: {len(bids)} bids" if bids else f"{name}: no roofing bids found")
         return bids[:8]
+
     except Exception as e:
         log.warning(f"{name}: {e}")
         return []
 
+# ── Main scraper ──────────────────────────────────────────────────────────────
 def run_scraper():
     log.info("=== Scraper starting ===")
     try:
         seen    = load_seen()
         current = {b["id"]: b for b in load_bids()}
-        fresh   = scrape_ctsource()
+        fresh   = []
+
         for name, url, org in TOWNS:
             fresh += scrape_town(name, url, org)
-            time.sleep(0.5)  # Be polite — avoid triggering rate limits
+            time.sleep(0.5)
+
         new_bids = [b for b in fresh if b["id"] not in seen]
-        log.info(f"Scraped: {len(fresh)} total | {len(new_bids)} new")
+        log.info(f"Total: {len(fresh)} | New: {len(new_bids)}")
+
         for b in fresh:
             if b["id"] not in current:
                 current[b["id"]] = b
@@ -335,15 +248,15 @@ def run_scraper():
     except Exception as e:
         log.error(f"Scraper error: {e}", exc_info=True)
 
-# ── Flask app ─────────────────────────────────────────────────────────────────
+# ── Flask ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-_bg_started = False
+_started = False
 
 @app.before_request
-def start_bg_once():
-    global _bg_started
-    if not _bg_started:
-        _bg_started = True
+def start_once():
+    global _started
+    if not _started:
+        _started = True
         log.info("First request — starting background tasks")
         def scheduler():
             schedule.every().day.at("06:00").do(run_scraper)
@@ -378,10 +291,9 @@ def api_scrape():
 def api_stats():
     bids = load_bids()
     return jsonify({
-        "total":     len(bids),
-        "ct_source": sum(1 for b in bids if b["source"] == "CT Source"),
-        "town":      sum(1 for b in bids if b["source"] == "Town"),
-        "last_run":  datetime.now().strftime("%b %d, %I:%M %p")
+        "total":    len(bids),
+        "town":     sum(1 for b in bids if b["source"] == "Town"),
+        "last_run": datetime.now().strftime("%b %d, %I:%M %p")
     })
 
 @app.route("/awards")
@@ -426,7 +338,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
 .tc:last-child{border:none}
 .dot{width:5px;height:5px;border-radius:50%;background:var(--green);flex-shrink:0}
 .main{padding:20px}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}
 .stat{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
 .slbl{font-family:var(--mono);font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px}
 .sval{font-family:var(--mono);font-size:22px;font-weight:600}
@@ -447,13 +359,9 @@ tbody tr{border-bottom:1px solid var(--border);cursor:pointer;transition:backgro
 tbody tr:last-child{border:none}
 tbody tr:hover{background:var(--surface2)}
 td{padding:11px 14px;vertical-align:middle}
-.bt{font-weight:500;color:var(--text);font-size:13px;max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bt{font-weight:500;color:var(--text);font-size:13px;max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .bo{font-family:var(--mono);font-size:10px;color:var(--text2);margin-top:2px}
-.badge{display:inline-flex;padding:2px 7px;border-radius:4px;font-family:var(--mono);font-size:10px;font-weight:600}
-.bct{background:rgba(139,92,246,.15);color:var(--purple);border:1px solid rgba(139,92,246,.3)}
-.btown{background:rgba(16,185,129,.15);color:var(--green);border:1px solid rgba(16,185,129,.3)}
-.dl{font-family:var(--mono);font-size:12px;white-space:nowrap}
-.dlu{color:var(--red)}.dls{color:var(--accent)}.dlo{color:var(--green)}
+.badge{display:inline-flex;padding:2px 7px;border-radius:4px;font-family:var(--mono);font-size:10px;font-weight:600;background:rgba(16,185,129,.15);color:var(--green);border:1px solid rgba(16,185,129,.3)}
 .ssel{background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:11px;padding:4px 7px;cursor:pointer;outline:none}
 .empty{text-align:center;padding:60px;color:var(--text2)}
 .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;margin-right:8px;vertical-align:middle}
@@ -494,16 +402,12 @@ td{padding:11px 14px;vertical-align:middle}
 <div class="layout">
   <aside class="sidebar">
     <div class="sb-sec">
-      <div class="sb-lbl">Source</div>
-      <button class="fb active" onclick="setSrc('all',this)">All Sources <span class="cnt" id="ca">0</span></button>
-      <button class="fb" onclick="setSrc('CT Source',this)">CT Source <span class="cnt" id="cct">0</span></button>
-      <button class="fb" onclick="setSrc('Town',this)">Town Pages <span class="cnt" id="ctw">0</span></button>
-    </div>
-    <div class="sb-sec">
-      <div class="sb-lbl">Deadline</div>
-      <button class="fb" onclick="setDl('urgent',this)">🔴 Under 7 days <span class="cnt" id="cu">0</span></button>
-      <button class="fb" onclick="setDl('soon',this)">🟡 7-14 days <span class="cnt" id="cs">0</span></button>
-      <button class="fb" onclick="setDl('ok',this)">🟢 14+ days <span class="cnt" id="co">0</span></button>
+      <div class="sb-lbl">Status Filter</div>
+      <button class="fb active" onclick="setSt('all',this)">All Bids <span class="cnt" id="ca">0</span></button>
+      <button class="fb" onclick="setSt('new',this)">New <span class="cnt" id="cn">0</span></button>
+      <button class="fb" onclick="setSt('reviewing',this)">Reviewing <span class="cnt" id="cr">0</span></button>
+      <button class="fb" onclick="setSt('bidding',this)">Bidding <span class="cnt" id="cb">0</span></button>
+      <button class="fb" onclick="setSt('submitted',this)">Submitted <span class="cnt" id="cs">0</span></button>
     </div>
     <div class="sb-sec">
       <div class="sb-lbl">Monitored Towns</div>
@@ -513,19 +417,11 @@ td{padding:11px 14px;vertical-align:middle}
   <main class="main">
     <div class="stats">
       <div class="stat"><div class="slbl">Open Bids</div><div class="sval" id="st">-</div><div class="ssub">all sources</div></div>
-      <div class="stat"><div class="slbl">Due This Week</div><div class="sval" style="color:var(--red)" id="su">-</div><div class="ssub">act fast</div></div>
-      <div class="stat"><div class="slbl">CT Source</div><div class="sval" style="color:var(--purple)" id="sct">-</div><div class="ssub">register for alerts</div></div>
       <div class="stat"><div class="slbl">Town Pages</div><div class="sval" style="color:var(--green)" id="stw">-</div><div class="ssub">Hartford region</div></div>
+      <div class="stat"><div class="slbl">Last Updated</div><div class="sval" style="font-size:14px;padding-top:4px" id="slr">-</div><div class="ssub">runs 6am &amp; 6pm</div></div>
     </div>
     <div class="toolbar">
       <div class="sw"><span class="swi">🔍</span><input id="search" placeholder="Search bids, towns, keywords..." oninput="render()"></div>
-      <div class="tabs">
-        <button class="tab active" onclick="setSt('all',this)">All</button>
-        <button class="tab" onclick="setSt('new',this)">New</button>
-        <button class="tab" onclick="setSt('reviewing',this)">Reviewing</button>
-        <button class="tab" onclick="setSt('bidding',this)">Bidding</button>
-        <button class="tab" onclick="setSt('submitted',this)">Submitted</button>
-      </div>
     </div>
     <div class="tbl-wrap">
       <table>
@@ -540,42 +436,33 @@ td{padding:11px 14px;vertical-align:middle}
 </div>
 <div class="toast" id="toast"></div>
 <script>
-const TOWNS=['Meriden','Enfield','Vernon','Bloomfield','Middletown','Bristol','Berlin','Glastonbury','Farmington','Windsor Locks','Southington','Tolland','New Britain','East Hartford','Manchester','Wethersfield','Newington','Windsor','Avon','Wallingford','Torrington','Granby'];
-let bids=[],src='all',status='all',dl=null;
+const TOWNS=['Meriden','Enfield','Vernon','Bloomfield','Middletown','Bristol','Newington','Windsor','Wethersfield','New Britain','Southington','Tolland','Glastonbury','Farmington','Windsor Locks','Berlin','East Hartford','Manchester','Wallingford','Granby','Cromwell','Canton'];
+let bids=[],status='all';
 document.getElementById('tlist').innerHTML=TOWNS.map(t=>`<div class="tc"><span class="dot"></span><span>${t}</span></div>`).join('');
-function du(d){if(!d)return null;try{return Math.ceil((new Date(d.slice(0,10))-new Date())/86400000)}catch{return null}}
-function dc(d){if(d===null)return'';if(d<7)return'dlu';if(d<=14)return'dls';return'dlo'}
-function fd(d){const v=du(d);if(!d||v===null)return'<span style="color:var(--text3)">-</span>';const l=new Date(d.slice(0,10)).toLocaleDateString('en-US',{month:'short',day:'numeric'});const t=v<0?'Closed':v===0?'TODAY':v+'d left';return`<span class="dl ${dc(v)}">${l}<br><span style="font-size:10px">${t}</span></span>`}
-function badge(s){return s==='CT Source'?'<span class="badge bct">CT Source</span>':'<span class="badge btown">Town</span>'}
 function ff(i){if(!i)return'-';try{return new Date(i).toLocaleDateString('en-US',{month:'short',day:'numeric'})}catch{return'-'}}
 function counts(){
-  document.getElementById('ca').textContent=bids.length;
-  document.getElementById('cct').textContent=bids.filter(b=>b.source==='CT Source').length;
-  document.getElementById('ctw').textContent=bids.filter(b=>b.source==='Town').length;
-  const u=bids.filter(b=>{const d=du(b.deadline);return d!==null&&d<7&&d>=0}).length;
-  document.getElementById('cu').textContent=u;
-  document.getElementById('cs').textContent=bids.filter(b=>{const d=du(b.deadline);return d!==null&&d>=7&&d<=14}).length;
-  document.getElementById('co').textContent=bids.filter(b=>{const d=du(b.deadline);return d!==null&&d>14}).length;
+  const tots={all:bids.length,new:0,reviewing:0,bidding:0,submitted:0};
+  bids.forEach(b=>{const s=b.status||'new';if(tots[s]!==undefined)tots[s]++;});
+  document.getElementById('ca').textContent=tots.all;
+  document.getElementById('cn').textContent=tots.new;
+  document.getElementById('cr').textContent=tots.reviewing;
+  document.getElementById('cb').textContent=tots.bidding;
+  document.getElementById('cs').textContent=tots.submitted;
   document.getElementById('st').textContent=bids.length;
-  document.getElementById('su').textContent=u;
-  document.getElementById('sct').textContent=bids.filter(b=>b.source==='CT Source').length;
   document.getElementById('stw').textContent=bids.filter(b=>b.source==='Town').length;
 }
 function render(){
   const q=document.getElementById('search').value.toLowerCase();
   let b=[...bids];
-  if(src!=='all')b=b.filter(x=>x.source===src);
   if(status!=='all')b=b.filter(x=>(x.status||'new')===status);
-  if(dl==='urgent')b=b.filter(x=>{const d=du(x.deadline);return d!==null&&d<7&&d>=0});
-  if(dl==='soon')b=b.filter(x=>{const d=du(x.deadline);return d!==null&&d>=7&&d<=14});
-  if(dl==='ok')b=b.filter(x=>{const d=du(x.deadline);return d!==null&&d>14});
   if(q)b=b.filter(x=>(x.title||'').toLowerCase().includes(q)||(x.org||'').toLowerCase().includes(q));
-  b.sort((a,x)=>(du(a.deadline)??9999)-(du(x.deadline)??9999));
+  b.sort((a,x)=>new Date(x.found)-new Date(a.found));
   const tb=document.getElementById('tb');
   if(!b.length){tb.innerHTML='<tr><td colspan="5"><div class="empty">No bids match your filters</div></td></tr>';return}
   tb.innerHTML=b.map(x=>{const s=x.status||'new';return`<tr onclick="openP('${x.id}')">
     <td><div class="bt" title="${x.title}">${x.title}</div><div class="bo">${x.org}</div></td>
-    <td>${badge(x.source)}</td><td>${fd(x.deadline)}</td>
+    <td><span class="badge">Town</span></td>
+    <td style="color:var(--text3);font-family:var(--mono);font-size:11px">-</td>
     <td style="font-family:var(--mono);font-size:11px;color:var(--text2)">${ff(x.found)}</td>
     <td onclick="event.stopPropagation()">
       <select class="ssel" onchange="saveSt('${x.id}',this.value)">
@@ -587,19 +474,15 @@ function render(){
         <option value="lost" ${s==='lost'?'selected':''}>Lost</option>
       </select></td></tr>`}).join('');
 }
-function setSrc(s,b){src=s;dl=null;document.querySelectorAll('.sb-sec .fb').forEach(x=>x.classList.remove('active'));b.classList.add('active');render()}
-function setDl(d,b){dl=dl===d?null:d;document.querySelectorAll('.sb-sec .fb').forEach(x=>x.classList.remove('active'));if(dl)b.classList.add('active');else document.querySelector('.fb').classList.add('active');render()}
-function setSt(s,b){status=s;document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');render()}
+function setSt(s,b){status=s;document.querySelectorAll('.sb-sec .fb').forEach(x=>x.classList.remove('active'));b.classList.add('active');render()}
 function saveSt(id,val){const b=bids.find(x=>x.id===id);if(b)b.status=val;fetch(`/api/status/${id}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:val,notes:b?.notes||''})});render()}
 function openP(id){
   const b=bids.find(x=>x.id===id);if(!b)return;
-  const v=du(b.deadline),c=dc(v);
   document.getElementById('pc').innerHTML=`
-    <div style="margin-bottom:8px">${badge(b.source)}</div>
-    <div class="pt">${b.title}</div><div class="po">${b.org}</div>
+    <span class="badge">Town</span>
+    <div class="pt" style="margin-top:10px">${b.title}</div>
+    <div class="po">${b.org}</div>
     <div class="dg">
-      <div class="df"><div class="dfl">Deadline</div><div class="dfv ${c}">${b.deadline?new Date(b.deadline.slice(0,10)).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'}):'Not listed'}</div></div>
-      <div class="df"><div class="dfl">Days Left</div><div class="dfv ${c}">${v===null?'-':v<0?'Closed':v===0?'TODAY':v+' days'}</div></div>
       <div class="df"><div class="dfl">Found</div><div class="dfv">${ff(b.found)}</div></div>
       <div class="df"><div class="dfl">Source</div><div class="dfv">${b.source}</div></div>
     </div>
@@ -613,25 +496,28 @@ function openP(id){
       <option value="lost" ${b.status==='lost'?'selected':''}>Lost</option>
     </select>
     <div class="psec">Notes</div>
-    <textarea class="nb" id="nb" placeholder="Add notes...">${b.notes||''}</textarea>
+    <textarea class="nb" id="nb" placeholder="Add notes about this bid...">${b.notes||''}</textarea>
     <div class="pa">
-      <a href="${b.link}" target="_blank" style="flex:1;text-decoration:none"><button class="bp" style="width:100%">View Official Bid</button></a>
+      <a href="${b.link}" target="_blank" style="flex:1;text-decoration:none"><button class="bp" style="width:100%">View Official Bid →</button></a>
       <button class="bs" onclick="saveN('${b.id}')">Save Notes</button>
       <button class="bs" onclick="closeP()">Close</button>
     </div>`;
   document.getElementById('ov').classList.add('open');
 }
-function saveN(id){const n=document.getElementById('nb').value;const b=bids.find(x=>x.id===id);if(b)b.notes=n;fetch(`/api/status/${id}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:b?.status||'new',notes:n})});toast('Notes saved')}
+function saveN(id){const n=document.getElementById('nb').value;const b=bids.find(x=>x.id===id);if(b)b.notes=n;fetch(`/api/status/${id}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:b?.status||'new',notes:n})});toast('Notes saved ✓')}
 function closeP(e){if(e&&e.target!==document.getElementById('ov'))return;document.getElementById('ov').classList.remove('open')}
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500)}
 async function go(){toast('Scraper started...');await fetch('/api/scrape',{method:'POST'});setTimeout(load,30000)}
 async function load(){
   try{
     const[a,b]=await Promise.all([fetch('/api/bids'),fetch('/api/stats')]);
-    bids=await a.json();const s=await b.json();
-    document.getElementById('last-run').textContent='Updated '+s.last_run;
+    bids=await a.json();
+    const s=await b.json();
+    document.getElementById('slr').textContent=s.last_run;
     counts();render();
-  }catch(e){document.getElementById('tb').innerHTML='<tr><td colspan="5" style="text-align:center;padding:40px;color:var(--text2)">Could not load bids</td></tr>'}
+  }catch(e){
+    document.getElementById('tb').innerHTML='<tr><td colspan="5" style="text-align:center;padding:40px;color:var(--text2)">Could not load bids — check Railway logs</td></tr>';
+  }
 }
 load();setInterval(load,5*60*1000);
 </script>
