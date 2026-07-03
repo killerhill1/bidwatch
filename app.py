@@ -91,8 +91,10 @@ TOWNS = [
     # User-verified URLs
     ("Farmington",    "https://www.farmington-ct.org/departments/finance-purchasing/purchasing/bids", "Town of Farmington"),
     ("Manchester",    "https://www.manchesterct.gov/Government/Departments/Purchasing/BIDS", "Town of Manchester"),
-    # Tolland + East Hartford block cloud IPs — covered via CT Source registration
-    # Glastonbury + Wallingford on BonfireHub — register at bonfirehub.com
+    # Massachusetts cities — high roofing bid volume
+    ("Springfield MA",  "https://www.springfield-ma.gov/finance/procurement-bids/open_bids.php", "City of Springfield MA"),
+    ("Worcester MA",    "https://www.worcesterma.gov/bids",                                       "City of Worcester MA"),
+    ("Providence RI",   "https://www.providenceri.gov/purchasing/bid-invitations/",               "City of Providence RI"),
 ]
 
 # ── Junk phrases to skip ──────────────────────────────────────────────────────
@@ -175,29 +177,34 @@ def scrape_samgov():
     session = make_session()
 
     from datetime import timedelta
-    today = datetime.now()
-    from_date = (today - timedelta(days=60)).strftime("%m/%d/%Y")
+    today     = datetime.now()
+    from_date = (today - timedelta(days=365)).strftime("%m/%d/%Y")
     to_date   = today.strftime("%m/%d/%Y")
 
-    for naics in ["238160", "238170", "238190"]:
+    # Search by keyword — catches bids regardless of NAICS code
+    for keyword in ["roofing", "roof replacement", "slate roof", "roof repair", "historic roof", "historic roofing", "slate roofing", "copper roofing"]:
         try:
+            params = {
+                "api_key":    api_key,
+                "limit":      25,
+                "postedFrom": from_date,
+                "postedTo":   to_date,
+                "keyword":    keyword,
+                "active":     "true",
+            }
             r = session.get(
                 "https://api.sam.gov/prod/opportunities/v2/search",
-                params={
-                    "api_key":     api_key,
-                    "limit":       25,
-                    "postedFrom":  from_date,
-                    "postedTo":    to_date,
-                    "naicsCode":   naics,
-                    "state":       "CT,MA,RI",
-                    "active":      "true",
-                },
+                params=params,
                 timeout=25
             )
-            r.raise_for_status()
-            data = r.json()
-            opps = data.get("opportunitiesData") or []
-            log.info(f"SAM.gov NAICS {naics}: {len(opps)} opportunities")
+            log.info(f"SAM.gov '{keyword}': HTTP {r.status_code}")
+            if not r.ok:
+                log.warning(f"SAM.gov error: {r.text[:300]}")
+                continue
+            data  = r.json()
+            total = data.get("totalRecords", 0)
+            opps  = data.get("opportunitiesData") or []
+            log.info(f"SAM.gov '{keyword}': {total} total, {len(opps)} returned")
 
             for o in opps:
                 bid_id = f"sam_{o.get('noticeId', abs(hash(o.get('title',''))))}"
@@ -216,7 +223,7 @@ def scrape_samgov():
                     "found":    datetime.now().isoformat()
                 })
         except Exception as e:
-            log.warning(f"SAM.gov NAICS {naics}: {e}")
+            log.warning(f"SAM.gov '{keyword}': {e}")
 
     log.info(f"SAM.gov total: {len(bids)} federal bids")
     return bids
