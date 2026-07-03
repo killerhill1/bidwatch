@@ -163,7 +163,63 @@ def save_seen(seen):
         except Exception as e:
             log.error(f"save_seen: {e}")
 
-# ── Town scraper ──────────────────────────────────────────────────────────────
+# ── SAM.gov scraper ───────────────────────────────────────────────────────────
+def scrape_samgov():
+    api_key = os.environ.get("SAM_API_KEY", "")
+    if not api_key:
+        log.warning("SAM_API_KEY not set — skipping federal bids")
+        return []
+
+    bids = []
+    seen_ids = set()
+    session = make_session()
+
+    from datetime import timedelta
+    today = datetime.now()
+    from_date = (today - timedelta(days=60)).strftime("%m/%d/%Y")
+    to_date   = today.strftime("%m/%d/%Y")
+
+    for naics in ["238160", "238170", "238190"]:
+        try:
+            r = session.get(
+                "https://api.sam.gov/prod/opportunities/v2/search",
+                params={
+                    "api_key":     api_key,
+                    "limit":       25,
+                    "postedFrom":  from_date,
+                    "postedTo":    to_date,
+                    "naicsCode":   naics,
+                    "state":       "CT,MA,RI",
+                    "active":      "true",
+                },
+                timeout=25
+            )
+            r.raise_for_status()
+            data = r.json()
+            opps = data.get("opportunitiesData") or []
+            log.info(f"SAM.gov NAICS {naics}: {len(opps)} opportunities")
+
+            for o in opps:
+                bid_id = f"sam_{o.get('noticeId', abs(hash(o.get('title',''))))}"
+                if bid_id in seen_ids:
+                    continue
+                seen_ids.add(bid_id)
+                bids.append({
+                    "id":       bid_id,
+                    "title":    o.get("title", "Untitled")[:200],
+                    "org":      o.get("department") or o.get("subTier") or "Federal Agency",
+                    "source":   "Federal",
+                    "deadline": (o.get("responseDeadLine") or "")[:10],
+                    "value":    None,
+                    "link":     o.get("uiLink") or f"https://sam.gov/opp/{o.get('noticeId')}/view",
+                    "status":   "new",
+                    "found":    datetime.now().isoformat()
+                })
+        except Exception as e:
+            log.warning(f"SAM.gov NAICS {naics}: {e}")
+
+    log.info(f"SAM.gov total: {len(bids)} federal bids")
+    return bids
 def scrape_town(name, url, org):
     bids     = []
     seen_ids = set()
@@ -227,7 +283,7 @@ def run_scraper():
     try:
         seen    = load_seen()
         current = {b["id"]: b for b in load_bids()}
-        fresh   = []
+        fresh   = scrape_samgov()
 
         for name, url, org in TOWNS:
             fresh += scrape_town(name, url, org)
@@ -292,8 +348,9 @@ def api_scrape():
 def api_stats():
     bids = load_bids()
     return jsonify({
-        "total":    len(bids),
-        "town":     sum(1 for b in bids if b["source"] == "Town"),
+        "total":   len(bids),
+        "federal": sum(1 for b in bids if b["source"] == "Federal"),
+        "town":    sum(1 for b in bids if b["source"] == "Town"),
         "last_run": datetime.now().strftime("%b %d, %I:%M %p")
     })
 
@@ -418,6 +475,7 @@ td{padding:11px 14px;vertical-align:middle}
   <main class="main">
     <div class="stats">
       <div class="stat"><div class="slbl">Open Bids</div><div class="sval" id="st">-</div><div class="ssub">all sources</div></div>
+      <div class="stat"><div class="slbl">Federal (SAM.gov)</div><div class="sval" style="color:var(--blue)" id="sf">-</div><div class="ssub">CT / MA / RI</div></div>
       <div class="stat"><div class="slbl">Town Pages</div><div class="sval" style="color:var(--green)" id="stw">-</div><div class="ssub">Hartford region</div></div>
       <div class="stat"><div class="slbl">Last Updated</div><div class="sval" style="font-size:14px;padding-top:4px" id="slr">-</div><div class="ssub">runs 6am &amp; 6pm</div></div>
     </div>
@@ -450,6 +508,7 @@ function counts(){
   document.getElementById('cb').textContent=tots.bidding;
   document.getElementById('cs').textContent=tots.submitted;
   document.getElementById('st').textContent=bids.length;
+  document.getElementById('sf').textContent=bids.filter(b=>b.source==='Federal').length;
   document.getElementById('stw').textContent=bids.filter(b=>b.source==='Town').length;
 }
 function render(){
@@ -462,7 +521,7 @@ function render(){
   if(!b.length){tb.innerHTML='<tr><td colspan="5"><div class="empty">No bids match your filters</div></td></tr>';return}
   tb.innerHTML=b.map(x=>{const s=x.status||'new';return`<tr onclick="openP('${x.id}')">
     <td><div class="bt" title="${x.title}">${x.title}</div><div class="bo">${x.org}</div></td>
-    <td><span class="badge">Town</span></td>
+    <td><span class="badge" style="${x.source==='Federal'?'background:rgba(59,130,246,.15);color:var(--blue);border-color:rgba(59,130,246,.3)':''}">${x.source==='Federal'?'⚑ Federal':'◆ Town'}</span></td>
     <td style="color:var(--text3);font-family:var(--mono);font-size:11px">-</td>
     <td style="font-family:var(--mono);font-size:11px;color:var(--text2)">${ff(x.found)}</td>
     <td onclick="event.stopPropagation()">
