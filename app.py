@@ -1,21 +1,59 @@
 """
 BidWatch — Courtman Enterprises LLC
-All-in-one version: dashboard HTML embedded, no external files needed
+v5: proper Flask startup, safe lxml fallback, verbose logging
 """
 
-from flask import Flask, jsonify, render_template_string, request
-import requests
-from bs4 import BeautifulSoup
-import json, os, re, threading, schedule, time
-from datetime import datetime
-from pathlib import Path
+# ── Logging first — before anything else so we catch all errors ───────────────
+import logging
+import sys
 
-app = Flask(__name__)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+log = logging.getLogger("bidwatch")
+log.info("BidWatch v5 starting — logging active")
 
-DATA_DIR  = Path("/tmp")
+# ── Safe lxml fallback ────────────────────────────────────────────────────────
+try:
+    import lxml
+    HTML_PARSER = "lxml"
+    log.info("lxml available — using lxml parser")
+except ImportError:
+    HTML_PARSER = "html.parser"
+    log.info("lxml not available — using html.parser (this is fine)")
+
+# ── Standard imports ──────────────────────────────────────────────────────────
+try:
+    from flask import Flask, jsonify, render_template_string, request
+    import requests
+    from bs4 import BeautifulSoup
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    import json, os, re, threading, schedule, time
+    from datetime import datetime
+    from pathlib import Path
+    log.info("All imports successful")
+except Exception as e:
+    log.critical(f"Import failed: {e}")
+    raise
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+DATA_DIR = Path("/tmp/bidwatch")
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    log.info(f"Data directory ready: {DATA_DIR}")
+except Exception as e:
+    log.warning(f"Could not create {DATA_DIR}: {e} — using /tmp")
+    DATA_DIR = Path("/tmp")
+
 DATA_FILE = DATA_DIR / "bids.json"
 SEEN_FILE = DATA_DIR / "seen.json"
+lock      = threading.Lock()
 
+# ── Config ────────────────────────────────────────────────────────────────────
 ROOFING_KEYWORDS = [
     "roof", "roofing", "slate", "shingle", "membrane", "flashing",
     "gutter", "copper", "waterproof", "tpo", "epdm", "flat roof",
@@ -48,6 +86,15 @@ TOWNS = [
     ("New Britain",    "https://www.newbritainct.gov/Bids.aspx",                       "City of New Britain"),
 ]
 
+# ── HTTP session with retries ─────────────────────────────────────────────────
+def make_session():
+    s = requests.Session()
+    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    s.mount("http://",  HTTPAdapter(max_retries=retry))
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    return s
+
+# ── Data helpers ──────────────────────────────────────────────────────────────
 def is_roofing(text):
     return any(kw in text.lower() for kw in ROOFING_KEYWORDS)
 
@@ -55,39 +102,59 @@ def clean(text):
     return re.sub(r'\s+', ' ', text or "").strip()
 
 def load_bids():
-    try:
-        if DATA_FILE.exists():
-            return json.loads(DATA_FILE.read_text())
-    except:
-        pass
-    return []
+    with lock:
+        try:
+            if DATA_FILE.exists():
+                return json.loads(DATA_FILE.read_text())
+        except Exception as e:
+            log.error(f"load_bids: {e}")
+        return []
 
 def save_bids(bids):
-    DATA_FILE.write_text(json.dumps(bids, indent=2))
+    with lock:
+        try:
+            tmp = DATA_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(bids, indent=2))
+            tmp.replace(DATA_FILE)
+        except Exception as e:
+            log.error(f"save_bids: {e}")
 
 def load_seen():
-    try:
-        if SEEN_FILE.exists():
-            return set(json.loads(SEEN_FILE.read_text()))
-    except:
-        pass
-    return set()
+    with lock:
+        try:
+            if SEEN_FILE.exists():
+                return set(json.loads(SEEN_FILE.read_text()))
+        except Exception as e:
+            log.error(f"load_seen: {e}")
+        return set()
 
 def save_seen(seen):
-    SEEN_FILE.write_text(json.dumps(list(seen)))
+    with lock:
+        try:
+            tmp = SEEN_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(list(seen)))
+            tmp.replace(SEEN_FILE)
+        except Exception as e:
+            log.error(f"save_seen: {e}")
 
+# ── Scrapers ──────────────────────────────────────────────────────────────────
 def scrape_ctsource():
     bids = []
     seen_ids = set()
+    session = make_session()
+
     for kw in ["roofing", "roof replacement", "slate", "membrane roof"]:
         try:
-            r = requests.get(
+            r = session.get(
                 "https://www.biznet.ct.gov/SCP_Search/BidResults.aspx",
                 params={"TN": kw, "CT": "B"},
                 headers=HEADERS, timeout=25
             )
-            soup = BeautifulSoup(r.text, "html.parser")
-            for row in soup.select("table tr")[1:]:
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, HTML_PARSER)
+            rows = soup.select("table tr")[1:]
+            log.debug(f"CT Source '{kw}': {len(rows)} rows returned")
+            for row in rows:
                 cols = row.find_all("td")
                 if len(cols) < 3:
                     continue
@@ -109,10 +176,12 @@ def scrape_ctsource():
                     "found": datetime.now().isoformat()
                 })
         except Exception as e:
-            print(f"  BizNet ({kw}): {e}")
+            log.warning(f"BizNet ({kw}): {e}")
+
     try:
-        r = requests.get("https://portal.ct.gov/das/construction-services/bidboard", headers=HEADERS, timeout=25)
-        soup = BeautifulSoup(r.text, "html.parser")
+        r = session.get("https://portal.ct.gov/das/construction-services/bidboard", headers=HEADERS, timeout=25)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, HTML_PARSER)
         for a in soup.find_all("a", href=True):
             text = clean(a.get_text())
             if len(text) < 15 or not is_roofing(text):
@@ -131,17 +200,19 @@ def scrape_ctsource():
                 "link": href, "status": "new", "found": datetime.now().isoformat()
             })
     except Exception as e:
-        print(f"  DAS: {e}")
-    print(f"  CT Source: {len(bids)} bids")
+        log.warning(f"DAS board: {e}")
+
+    log.info(f"CT Source total: {len(bids)} bids")
     return bids
 
 def scrape_town(name, url, org):
     bids = []
     seen_ids = set()
+    session = make_session()
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
+        r = session.get(url, headers=HEADERS, timeout=15)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(r.text, HTML_PARSER)
         for tag in soup.find_all(["a", "li", "tr", "p", "div"]):
             text = clean(tag.get_text())
             if len(text) < 15 or len(text) > 300 or not is_roofing(text):
@@ -166,29 +237,63 @@ def scrape_town(name, url, org):
                 "link": link, "status": "new", "found": datetime.now().isoformat()
             })
         if bids:
-            print(f"  {name}: {len(bids[:8])} bids")
+            log.info(f"{name}: {len(bids[:8])} bids")
         return bids[:8]
     except Exception as e:
-        print(f"  {name}: {e}")
+        log.warning(f"{name}: {e}")
         return []
 
 def run_scraper():
-    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Scraper running...")
-    seen = load_seen()
-    current = {b["id"]: b for b in load_bids()}
-    fresh = scrape_ctsource()
-    for name, url, org in TOWNS:
-        fresh += scrape_town(name, url, org)
-    new_bids = [b for b in fresh if b["id"] not in seen]
-    print(f"  Total: {len(fresh)} | New: {len(new_bids)}")
-    for b in fresh:
-        if b["id"] not in current:
-            current[b["id"]] = b
-    if new_bids:
-        seen.update(b["id"] for b in new_bids)
-        save_seen(seen)
-    save_bids(list(current.values())[:500])
+    log.info("=== Scraper run starting ===")
+    try:
+        seen    = load_seen()
+        current = {b["id"]: b for b in load_bids()}
+        fresh   = scrape_ctsource()
+        for name, url, org in TOWNS:
+            fresh += scrape_town(name, url, org)
+        new_bids = [b for b in fresh if b["id"] not in seen]
+        log.info(f"Total scraped: {len(fresh)} | New this run: {len(new_bids)}")
+        for b in fresh:
+            if b["id"] not in current:
+                current[b["id"]] = b
+        if new_bids:
+            seen.update(b["id"] for b in new_bids)
+            save_seen(seen)
+        save_bids(list(current.values())[:500])
+        log.info("=== Scraper run complete ===")
+    except Exception as e:
+        log.error(f"Scraper run failed: {e}", exc_info=True)
 
+# ── Flask app ─────────────────────────────────────────────────────────────────
+log.info("Creating Flask app...")
+app = Flask(__name__)
+
+# ── Gunicorn + python-safe startup using app context ─────────────────────────
+_started = False
+
+def start_background_tasks():
+    global _started
+    if _started:
+        return
+    _started = True
+    log.info("Starting background tasks (scraper + scheduler)...")
+
+    def scheduler_loop():
+        schedule.every().day.at("06:00").do(run_scraper)
+        schedule.every().day.at("18:00").do(run_scraper)
+        log.info("Scheduler ready — runs at 06:00 and 18:00 daily")
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
+
+    threading.Thread(target=run_scraper,    daemon=True, name="initial-scrape").start()
+    threading.Thread(target=scheduler_loop, daemon=True, name="scheduler").start()
+
+# Works with both gunicorn and python app.py
+with app.app_context():
+    start_background_tasks()
+
+# ── API routes ────────────────────────────────────────────────────────────────
 @app.route("/api/bids")
 def api_bids():
     return jsonify(load_bids())
@@ -200,7 +305,7 @@ def api_status(bid_id):
     for b in bids:
         if b["id"] == bid_id:
             b["status"] = data.get("status", "new")
-            b["notes"] = data.get("notes", b.get("notes", ""))
+            b["notes"]  = data.get("notes", b.get("notes", ""))
     save_bids(bids)
     return jsonify({"ok": True})
 
@@ -213,27 +318,20 @@ def api_scrape():
 def api_stats():
     bids = load_bids()
     return jsonify({
-        "total": len(bids),
+        "total":     len(bids),
         "ct_source": sum(1 for b in bids if b["source"] == "CT Source"),
-        "town": sum(1 for b in bids if b["source"] == "Town"),
-        "last_run": datetime.now().strftime("%b %d, %I:%M %p")
+        "town":      sum(1 for b in bids if b["source"] == "Town"),
+        "last_run":  datetime.now().strftime("%b %d, %I:%M %p")
     })
-
-@app.route("/")
-def dashboard():
-    return render_template_string(DASHBOARD)
 
 @app.route("/awards")
 def awards():
     f = Path(__file__).parent / "awards.html"
     return f.read_text() if f.exists() else "<h1>Awards page coming soon</h1>"
 
-def start_scheduler():
-    schedule.every().day.at("06:00").do(run_scraper)
-    schedule.every().day.at("18:00").do(run_scraper)
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+@app.route("/")
+def dashboard():
+    return render_template_string(DASHBOARD)
 
 DASHBOARD = """<!DOCTYPE html>
 <html lang="en">
@@ -328,7 +426,7 @@ td{padding:11px 14px;vertical-align:middle}
   <div class="logo"><div class="logo-icon">🏗</div>BidWatch<span style="font-size:11px;color:var(--text3);font-weight:400;margin-left:4px">· Courtman Enterprises</span></div>
   <div class="hdr-right">
     <span class="live">LIVE</span>
-    <span style="font-family:var(--mono);font-size:11px;color:var(--text2)" id="last-run">—</span>
+    <span style="font-family:var(--mono);font-size:11px;color:var(--text2)" id="last-run">-</span>
     <a href="/awards" class="btn btn-blue">🏆 Award Intel</a>
     <button class="btn" onclick="go()">↻ Refresh Now</button>
   </div>
@@ -354,10 +452,10 @@ td{padding:11px 14px;vertical-align:middle}
   </aside>
   <main class="main">
     <div class="stats">
-      <div class="stat"><div class="slbl">Open Bids</div><div class="sval" id="st">—</div><div class="ssub">all sources</div></div>
-      <div class="stat"><div class="slbl">Due This Week</div><div class="sval" style="color:var(--red)" id="su">—</div><div class="ssub">act fast</div></div>
-      <div class="stat"><div class="slbl">CT Source</div><div class="sval" style="color:var(--purple)" id="sct">—</div><div class="ssub">262 CT entities</div></div>
-      <div class="stat"><div class="slbl">Town Pages</div><div class="sval" style="color:var(--green)" id="stw">—</div><div class="ssub">Hartford region</div></div>
+      <div class="stat"><div class="slbl">Open Bids</div><div class="sval" id="st">-</div><div class="ssub">all sources</div></div>
+      <div class="stat"><div class="slbl">Due This Week</div><div class="sval" style="color:var(--red)" id="su">-</div><div class="ssub">act fast</div></div>
+      <div class="stat"><div class="slbl">CT Source</div><div class="sval" style="color:var(--purple)" id="sct">-</div><div class="ssub">262 CT entities</div></div>
+      <div class="stat"><div class="slbl">Town Pages</div><div class="sval" style="color:var(--green)" id="stw">-</div><div class="ssub">Hartford region</div></div>
     </div>
     <div class="toolbar">
       <div class="sw"><span class="swi">🔍</span><input id="search" placeholder="Search bids, towns, keywords..." oninput="render()"></div>
@@ -389,7 +487,7 @@ function du(d){if(!d)return null;try{return Math.ceil((new Date(d.slice(0,10))-n
 function dc(d){if(d===null)return'';if(d<7)return'dlu';if(d<=14)return'dls';return'dlo'}
 function fd(d){const v=du(d);if(!d||v===null)return'<span style="color:var(--text3)">-</span>';const l=new Date(d.slice(0,10)).toLocaleDateString('en-US',{month:'short',day:'numeric'});const t=v<0?'Closed':v===0?'TODAY':v+'d left';return`<span class="dl ${dc(v)}">${l}<br><span style="font-size:10px">${t}</span></span>`}
 function badge(s){return s==='CT Source'?'<span class="badge bct">CT Source</span>':'<span class="badge btown">Town</span>'}
-function ff(i){if(!i)return'—';try{return new Date(i).toLocaleDateString('en-US',{month:'short',day:'numeric'})}catch{return'—'}}
+function ff(i){if(!i)return'-';try{return new Date(i).toLocaleDateString('en-US',{month:'short',day:'numeric'})}catch{return'-'}}
 function counts(){
   document.getElementById('ca').textContent=bids.length;
   document.getElementById('cct').textContent=bids.filter(b=>b.source==='CT Source').length;
@@ -441,7 +539,7 @@ function openP(id){
     <div class="pt">${b.title}</div><div class="po">${b.org}</div>
     <div class="dg">
       <div class="df"><div class="dfl">Deadline</div><div class="dfv ${c}">${b.deadline?new Date(b.deadline.slice(0,10)).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'}):'Not listed'}</div></div>
-      <div class="df"><div class="dfl">Days Left</div><div class="dfv ${c}">${v===null?'—':v<0?'Closed':v===0?'TODAY':v+' days'}</div></div>
+      <div class="df"><div class="dfl">Days Left</div><div class="dfv ${c}">${v===null?'-':v<0?'Closed':v===0?'TODAY':v+' days'}</div></div>
       <div class="df"><div class="dfl">Found</div><div class="dfv">${ff(b.found)}</div></div>
       <div class="df"><div class="dfl">Source</div><div class="dfv">${b.source}</div></div>
     </div>
@@ -480,8 +578,8 @@ load();setInterval(load,5*60*1000);
 </body>
 </html>"""
 
+log.info("App ready")
+
 if __name__ == "__main__":
-    threading.Thread(target=run_scraper, daemon=True).start()
-    threading.Thread(target=start_scheduler, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
