@@ -92,7 +92,7 @@ TOWNS = [
     ("Farmington",    "https://www.farmington-ct.org/departments/finance-purchasing/purchasing/bids", "Town of Farmington"),
     ("Manchester",    "https://www.manchesterct.gov/Government/Departments/Purchasing/BIDS", "Town of Manchester"),
     # Massachusetts cities — high roofing bid volume
-    ("Springfield MA",  "https://www.springfield-ma.gov/finance/procurement-bids/open_bids.php", "City of Springfield MA"),
+    ("Springfield MA",  "https://www.springfield-ma.gov/finance/procurement-bids/",              "City of Springfield MA"),
     ("Worcester MA",    "https://www.worcesterma.gov/bids",                                       "City of Worcester MA"),
     ("Providence RI",   "https://www.providenceri.gov/purchasing/bid-invitations/",               "City of Providence RI"),
 ]
