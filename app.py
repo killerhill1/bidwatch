@@ -84,18 +84,15 @@ TOWNS = [
     ("New Britain",   "https://www.newbritainct.gov/services/purchasing/bidshtm",            "City of New Britain"),
     ("Southington",   "https://www.southingtonct.gov/departments/engineering_department/bid_invitations.php", "Town of Southington"),
     ("Granby",        "https://www.granby-ct.gov/Bids.aspx",                                 "Town of Granby"),
-    ("Canton",        "https://www.townofcantonct.org/active-bids/",                          "Town of Canton"),
-    ("Cromwell",      "https://www.cromwellct.com/bids",                                      "Town of Cromwell"),
-    # User-verified URLs
-    ("Farmington",    "https://www.farmington-ct.org/departments/finance-purchasing/purchasing/bids/-sortn-RFPStarting/-sortd-desc#RFPStarting_550_1794_1647", "Town of Farmington"),
-    ("Tolland",       "https://www.tollandct.gov/bids",                                      "Town of Tolland"),
-    ("East Hartford", "https://www.easthartfordct.gov/bids",                                 "Town of East Hartford"),
-    ("Manchester",    "https://www.manchesterct.gov/Government/Departments/Purchasing/BIDS", "Town of Manchester"),
-    ("Windsor Locks", "https://windsorlocksct.org/bidding-opportunities/",                   "Town of Windsor Locks"),
     ("Berlin",        "https://www.berlinct.gov/topic/subtopic.php?topicid=412&structureid=123", "Town of Berlin"),
-    # Glastonbury + Wallingford use BonfireHub portal — register at bonfirehub.com for email alerts
-    # ("Glastonbury", "https://glastonburyct.bonfirehub.com/portal/?tab=openOpportunities", "Town of Glastonbury"),
-    # ("Wallingford", "https://wallingford.bonfirehub.com/portal/?tab=openOpportunities",   "Town of Wallingford"),
+    ("Windsor Locks", "https://windsorlocksct.org/bidding-opportunities/",                   "Town of Windsor Locks"),
+    ("Cromwell",      "https://www.cromwellct.com/bids",                                     "Town of Cromwell"),
+    ("Canton",        "https://www.townofcantonct.org/active-bids",                          "Town of Canton"),
+    # User-verified URLs
+    ("Farmington",    "https://www.farmington-ct.org/departments/finance-purchasing/purchasing/bids", "Town of Farmington"),
+    ("Manchester",    "https://www.manchesterct.gov/Government/Departments/Purchasing/BIDS", "Town of Manchester"),
+    # Tolland + East Hartford block cloud IPs — covered via CT Source registration
+    # Glastonbury + Wallingford on BonfireHub — register at bonfirehub.com
 ]
 
 # ── Junk phrases to skip ──────────────────────────────────────────────────────
@@ -178,6 +175,8 @@ def scrape_town(name, url, org):
     try:
         r = session.get(url, headers=get_headers(referer=homepage), timeout=15)
         r.raise_for_status()
+        # Force UTF-8 decoding and handle compressed responses
+        r.encoding = r.apparent_encoding or 'utf-8'
         soup = BeautifulSoup(r.text, "html.parser")
 
         # Strip chrome
@@ -251,21 +250,23 @@ def run_scraper():
 # ── Flask ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 _started = False
+_start_lock = threading.Lock()
 
 @app.before_request
 def start_once():
     global _started
-    if not _started:
-        _started = True
-        log.info("First request — starting background tasks")
-        def scheduler():
-            schedule.every().day.at("06:00").do(run_scraper)
-            schedule.every().day.at("18:00").do(run_scraper)
-            while True:
-                schedule.run_pending()
-                time.sleep(60)
-        threading.Thread(target=run_scraper, daemon=True, name="scraper").start()
-        threading.Thread(target=scheduler,   daemon=True, name="scheduler").start()
+    with _start_lock:
+        if not _started:
+            _started = True
+            log.info("First request — starting background tasks")
+            def scheduler():
+                schedule.every().day.at("06:00").do(run_scraper)
+                schedule.every().day.at("18:00").do(run_scraper)
+                while True:
+                    schedule.run_pending()
+                    time.sleep(60)
+            threading.Thread(target=run_scraper, daemon=True, name="scraper").start()
+            threading.Thread(target=scheduler,   daemon=True, name="scheduler").start()
 
 @app.route("/api/bids")
 def api_bids():
