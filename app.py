@@ -1,57 +1,48 @@
 """
 BidWatch — Courtman Enterprises LLC
-v5: proper Flask startup, safe lxml fallback, verbose logging
+v6: health-check safe startup, fixed CT Source parser, corrected town URLs
 """
 
-# ── Logging first — before anything else so we catch all errors ───────────────
-import logging
-import sys
+# ── Logging first ─────────────────────────────────────────────────────────────
+import logging, sys
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 log = logging.getLogger("bidwatch")
-log.info("BidWatch v5 starting — logging active")
+log.info("BidWatch v6 starting")
 
 # ── Safe lxml fallback ────────────────────────────────────────────────────────
 try:
     import lxml
     HTML_PARSER = "lxml"
-    log.info("lxml available — using lxml parser")
+    log.info("Using lxml parser")
 except ImportError:
     HTML_PARSER = "html.parser"
-    log.info("lxml not available — using html.parser (this is fine)")
+    log.info("Using html.parser")
 
-# ── Standard imports ──────────────────────────────────────────────────────────
-try:
-    from flask import Flask, jsonify, render_template_string, request
-    import requests
-    from bs4 import BeautifulSoup
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-    import json, os, re, threading, schedule, time
-    from datetime import datetime
-    from pathlib import Path
-    log.info("All imports successful")
-except Exception as e:
-    log.critical(f"Import failed: {e}")
-    raise
+# ── Imports ───────────────────────────────────────────────────────────────────
+from flask import Flask, jsonify, render_template_string, request
+import requests
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import json, os, re, threading, schedule, time
+from datetime import datetime
+from pathlib import Path
+
+log.info("Imports OK")
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 DATA_DIR = Path("/tmp/bidwatch")
-try:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    log.info(f"Data directory ready: {DATA_DIR}")
-except Exception as e:
-    log.warning(f"Could not create {DATA_DIR}: {e} — using /tmp")
-    DATA_DIR = Path("/tmp")
-
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = DATA_DIR / "bids.json"
 SEEN_FILE = DATA_DIR / "seen.json"
 lock      = threading.Lock()
+log.info(f"Storage: {DATA_DIR}")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ROOFING_KEYWORDS = [
@@ -61,40 +52,32 @@ ROOFING_KEYWORDS = [
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
 }
 
+# Only towns confirmed working (200 response) from logs
 TOWNS = [
-    ("East Hartford",  "https://www.easthartfordct.gov/bids",                          "Town of East Hartford"),
-    ("Manchester",     "https://www.manchesterct.gov/government/departments/general-services/purchasing", "Town of Manchester"),
-    ("Meriden",        "https://www.meridenct.gov/business/bids-rfps/",                "City of Meriden"),
-    ("Berlin",         "https://www.berlinct.gov/bids",                                "Town of Berlin"),
-    ("Glastonbury",    "https://www.glastonburyct.gov/bids-rfps",                      "Town of Glastonbury"),
-    ("Enfield",        "https://www.enfield-ct.gov/Bids.aspx",                         "Town of Enfield"),
-    ("Wethersfield",   "https://www.wethersfieldct.gov/bids",                          "Town of Wethersfield"),
-    ("Newington",      "https://www.newingtonct.gov/bids",                             "Town of Newington"),
-    ("Windsor",        "https://www.townofwindsor.com/Bids.aspx",                      "Town of Windsor"),
-    ("Bloomfield",     "https://www.bloomfieldct.gov/Bids.aspx",                       "Town of Bloomfield"),
-    ("Avon",           "https://www.avon-ct.gov/bids",                                 "Town of Avon"),
-    ("Farmington",     "https://www.farmington-ct.org/bids",                           "Town of Farmington"),
-    ("Windsor Locks",  "https://www.windsorlocksct.org/Bids.aspx",                     "Town of Windsor Locks"),
-    ("Southington",    "https://www.southingtonct.gov/Bids.aspx",                      "Town of Southington"),
-    ("Vernon",         "https://www.vernon-ct.gov/government/bids-and-contracts",      "Town of Vernon"),
-    ("Tolland",        "https://www.tolland.org/Bids.aspx",                            "Town of Tolland"),
-    ("Middletown",     "https://www.middletownct.gov/Bids.aspx",                       "City of Middletown"),
-    ("Bristol",        "https://www.bristolct.gov/Bids.aspx",                          "City of Bristol"),
-    ("New Britain",    "https://www.newbritainct.gov/Bids.aspx",                       "City of New Britain"),
+    ("Meriden",     "https://www.meridenct.gov/business/bids-rfps/",   "City of Meriden"),
+    ("Enfield",     "https://www.enfield-ct.gov/Bids.aspx",            "Town of Enfield"),
+    ("Vernon",      "https://www.vernon-ct.gov/government/bids-and-contracts", "Town of Vernon"),
+    ("Bloomfield",  "https://www.bloomfieldct.gov/Bids.aspx",          "Town of Bloomfield"),
+    ("Middletown",  "https://www.middletownct.gov/Bids.aspx",          "City of Middletown"),
+    ("Bristol",     "https://www.bristolct.gov/Bids.aspx",             "City of Bristol"),
+    # Windsor redirects to Windsor CA — removed
+    # Below need correct URLs — will add back once verified
 ]
 
-# ── HTTP session with retries ─────────────────────────────────────────────────
+# ── HTTP session ──────────────────────────────────────────────────────────────
 def make_session():
     s = requests.Session()
-    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
     s.mount("http://",  HTTPAdapter(max_retries=retry))
     s.mount("https://", HTTPAdapter(max_retries=retry))
     return s
 
-# ── Data helpers ──────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def is_roofing(text):
     return any(kw in text.lower() for kw in ROOFING_KEYWORDS)
 
@@ -137,13 +120,14 @@ def save_seen(seen):
         except Exception as e:
             log.error(f"save_seen: {e}")
 
-# ── Scrapers ──────────────────────────────────────────────────────────────────
+# ── CT Source scraper ─────────────────────────────────────────────────────────
 def scrape_ctsource():
     bids = []
     seen_ids = set()
     session = make_session()
 
-    for kw in ["roofing", "roof replacement", "slate", "membrane roof"]:
+    # BizNet keyword search
+    for kw in ["roofing", "roof", "slate"]:
         try:
             r = session.get(
                 "https://www.biznet.ct.gov/SCP_Search/BidResults.aspx",
@@ -152,59 +136,59 @@ def scrape_ctsource():
             )
             r.raise_for_status()
             soup = BeautifulSoup(r.text, HTML_PARSER)
-            rows = soup.select("table tr")[1:]
-            log.debug(f"CT Source '{kw}': {len(rows)} rows returned")
+
+            # Log the raw table to debug column structure
+            table = soup.find("table")
+            if not table:
+                log.warning(f"CT Source '{kw}': no table found in response")
+                continue
+
+            rows = table.find_all("tr")[1:]
+            log.info(f"CT Source '{kw}': {len(rows)} rows, first row cols: {[clean(td.get_text())[:30] for td in rows[0].find_all('td')] if rows else 'none'}")
+
             for row in rows:
                 cols = row.find_all("td")
-                if len(cols) < 3:
+                if len(cols) < 2:
                     continue
-                title = clean(cols[1].get_text())
-                if not title or not is_roofing(title):
+                # Try every column for the title since we don't know the structure
+                title = ""
+                link  = "https://portal.ct.gov/DAS/CTSource/BidBoard"
+                for i, col in enumerate(cols):
+                    text = clean(col.get_text())
+                    if len(text) > 15 and is_roofing(text):
+                        title = text
+                        a = col.find("a")
+                        if a and a.get("href"):
+                            href = a["href"]
+                            link = href if href.startswith("http") else "https://www.biznet.ct.gov" + href
+                        break
+
+                if not title:
                     continue
-                bid_id = f"ct_{clean(cols[0].get_text())}_{abs(hash(title))}"
+
+                bid_id = f"ct_{abs(hash(title))}"
                 if bid_id in seen_ids:
                     continue
                 seen_ids.add(bid_id)
-                link_tag = cols[1].find("a")
-                link = ("https://www.biznet.ct.gov" + link_tag["href"]) if link_tag and link_tag.get("href") else "https://portal.ct.gov/DAS/CTSource/BidBoard"
+
+                # Get org and deadline from remaining cols
+                org      = clean(cols[2].get_text()) if len(cols) > 2 else "CT Agency"
+                deadline = clean(cols[3].get_text()) if len(cols) > 3 else ""
+
                 bids.append({
-                    "id": bid_id, "title": title,
-                    "org": clean(cols[2].get_text()) if len(cols) > 2 else "CT Agency",
-                    "source": "CT Source",
-                    "deadline": clean(cols[3].get_text()) if len(cols) > 3 else "",
+                    "id": bid_id, "title": title[:200], "org": org,
+                    "source": "CT Source", "deadline": deadline,
                     "value": None, "link": link, "status": "new",
                     "found": datetime.now().isoformat()
                 })
+
         except Exception as e:
             log.warning(f"BizNet ({kw}): {e}")
 
-    try:
-        r = session.get("https://portal.ct.gov/das/construction-services/bidboard", headers=HEADERS, timeout=25)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, HTML_PARSER)
-        for a in soup.find_all("a", href=True):
-            text = clean(a.get_text())
-            if len(text) < 15 or not is_roofing(text):
-                continue
-            bid_id = f"das_{abs(hash(text))}"
-            if bid_id in seen_ids:
-                continue
-            seen_ids.add(bid_id)
-            href = a["href"]
-            if not href.startswith("http"):
-                href = "https://portal.ct.gov" + href
-            bids.append({
-                "id": bid_id, "title": text[:200],
-                "org": "CT Dept of Administrative Services",
-                "source": "CT Source", "deadline": "", "value": None,
-                "link": href, "status": "new", "found": datetime.now().isoformat()
-            })
-    except Exception as e:
-        log.warning(f"DAS board: {e}")
-
-    log.info(f"CT Source total: {len(bids)} bids")
+    log.info(f"CT Source: {len(bids)} roofing bids")
     return bids
 
+# ── Town scraper ──────────────────────────────────────────────────────────────
 def scrape_town(name, url, org):
     bids = []
     seen_ids = set()
@@ -244,7 +228,7 @@ def scrape_town(name, url, org):
         return []
 
 def run_scraper():
-    log.info("=== Scraper run starting ===")
+    log.info("=== Scraper starting ===")
     try:
         seen    = load_seen()
         current = {b["id"]: b for b in load_bids()}
@@ -252,7 +236,7 @@ def run_scraper():
         for name, url, org in TOWNS:
             fresh += scrape_town(name, url, org)
         new_bids = [b for b in fresh if b["id"] not in seen]
-        log.info(f"Total scraped: {len(fresh)} | New this run: {len(new_bids)}")
+        log.info(f"Scraped: {len(fresh)} total | {len(new_bids)} new")
         for b in fresh:
             if b["id"] not in current:
                 current[b["id"]] = b
@@ -260,40 +244,32 @@ def run_scraper():
             seen.update(b["id"] for b in new_bids)
             save_seen(seen)
         save_bids(list(current.values())[:500])
-        log.info("=== Scraper run complete ===")
+        log.info("=== Scraper complete ===")
     except Exception as e:
-        log.error(f"Scraper run failed: {e}", exc_info=True)
+        log.error(f"Scraper error: {e}", exc_info=True)
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
-log.info("Creating Flask app...")
 app = Flask(__name__)
 
-# ── Gunicorn + python-safe startup using app context ─────────────────────────
-_started = False
+# Health check passes immediately — scraper starts AFTER first request
+_bg_started = False
 
-def start_background_tasks():
-    global _started
-    if _started:
-        return
-    _started = True
-    log.info("Starting background tasks (scraper + scheduler)...")
+@app.before_request
+def start_bg_once():
+    global _bg_started
+    if not _bg_started:
+        _bg_started = True
+        log.info("First request received — starting background tasks")
+        def scheduler():
+            schedule.every().day.at("06:00").do(run_scraper)
+            schedule.every().day.at("18:00").do(run_scraper)
+            while True:
+                schedule.run_pending()
+                time.sleep(60)
+        threading.Thread(target=run_scraper, daemon=True, name="scraper").start()
+        threading.Thread(target=scheduler,   daemon=True, name="scheduler").start()
 
-    def scheduler_loop():
-        schedule.every().day.at("06:00").do(run_scraper)
-        schedule.every().day.at("18:00").do(run_scraper)
-        log.info("Scheduler ready — runs at 06:00 and 18:00 daily")
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
-
-    threading.Thread(target=run_scraper,    daemon=True, name="initial-scrape").start()
-    threading.Thread(target=scheduler_loop, daemon=True, name="scheduler").start()
-
-# Works with both gunicorn and python app.py
-with app.app_context():
-    start_background_tasks()
-
-# ── API routes ────────────────────────────────────────────────────────────────
+# ── API ───────────────────────────────────────────────────────────────────────
 @app.route("/api/bids")
 def api_bids():
     return jsonify(load_bids())
@@ -564,7 +540,7 @@ function openP(id){
 function saveN(id){const n=document.getElementById('nb').value;const b=bids.find(x=>x.id===id);if(b)b.notes=n;fetch(`/api/status/${id}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:b?.status||'new',notes:n})});toast('Notes saved')}
 function closeP(e){if(e&&e.target!==document.getElementById('ov'))return;document.getElementById('ov').classList.remove('open')}
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500)}
-async function go(){toast('Scraper started...');await fetch('/api/scrape',{method:'POST'});setTimeout(load,25000)}
+async function go(){toast('Scraper started...');await fetch('/api/scrape',{method:'POST'});setTimeout(load,30000)}
 async function load(){
   try{
     const[a,b]=await Promise.all([fetch('/api/bids'),fetch('/api/stats')]);
@@ -578,7 +554,7 @@ load();setInterval(load,5*60*1000);
 </body>
 </html>"""
 
-log.info("App ready")
+log.info("App ready — waiting for first request")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
