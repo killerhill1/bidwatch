@@ -217,6 +217,26 @@ def scrape_ctsource():
     log.info(f"CT Source: {len(bids)} roofing bids")
     return bids
 
+JUNK_PHRASES = [
+    "sign in", "create account", "website sign in", "printer friendly",
+    "email page", "contact us", "site map", "translate page",
+    "my account", "facebook", "twitter", "pinterest", "linkedin",
+    "rss", "notifications", "read on", "subscribe", "copyright",
+    "all rights reserved", "powered by", "skip to", "main menu",
+    "home page", "search", "parade", "postponed", "delicious", "blogger",
+]
+
+def is_junk(text):
+    t = text.lower()
+    # Too many words that suggest navigation/footer
+    if any(phrase in t for phrase in JUNK_PHRASES):
+        return True
+    # Repeated words suggest nav text being concatenated
+    words = t.split()
+    if len(words) > 3 and len(set(words)) < len(words) * 0.6:
+        return True
+    return False
+
 def scrape_town(name, url, org):
     bids = []
     seen_ids = set()
@@ -225,31 +245,57 @@ def scrape_town(name, url, org):
         r = session.get(url, headers=get_headers(), timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, HTML_PARSER)
-        for tag in soup.find_all(["a", "li", "tr", "p", "div"]):
-            text = clean(tag.get_text())
-            if len(text) < 15 or len(text) > 300 or not is_roofing(text):
+
+        # Remove nav, footer, header, sidebar before scanning
+        for tag in soup.find_all(["nav", "footer", "header", "aside",
+                                   "script", "style", "noscript"]):
+            tag.decompose()
+
+        # Also remove common nav class/id patterns
+        for tag in soup.find_all(class_=re.compile(
+                r"nav|menu|footer|header|sidebar|social|breadcrumb|banner|alert|news",
+                re.I)):
+            tag.decompose()
+        for tag in soup.find_all(id=re.compile(
+                r"nav|menu|footer|header|sidebar|social|breadcrumb|banner|alert|news",
+                re.I)):
+            tag.decompose()
+
+        # Now scan only links — actual bids almost always have a clickable link
+        for a in soup.find_all("a", href=True):
+            text = clean(a.get_text())
+            if len(text) < 10 or len(text) > 200:
                 continue
+            if not is_roofing(text):
+                continue
+            if is_junk(text):
+                continue
+
+            href = a["href"]
+            if href.startswith("http"):
+                link = href
+            elif href.startswith("/"):
+                from urllib.parse import urlparse
+                base = urlparse(url)
+                link = f"{base.scheme}://{base.netloc}{href}"
+            else:
+                link = url
+
             bid_id = f"{name.lower().replace(' ','_')}_{abs(hash(text))}"
             if bid_id in seen_ids:
                 continue
             seen_ids.add(bid_id)
-            a = tag if tag.name == "a" else tag.find("a")
-            link = url
-            if a and a.get("href"):
-                href = a["href"]
-                if href.startswith("http"):
-                    link = href
-                elif href.startswith("/"):
-                    from urllib.parse import urlparse
-                    base = urlparse(url)
-                    link = f"{base.scheme}://{base.netloc}{href}"
+
             bids.append({
                 "id": bid_id, "title": text[:200], "org": org,
                 "source": "Town", "deadline": "", "value": None,
                 "link": link, "status": "new", "found": datetime.now().isoformat()
             })
+
         if bids:
-            log.info(f"{name}: {len(bids[:8])} bids")
+            log.info(f"{name}: {len(bids)} bids")
+        else:
+            log.info(f"{name}: no roofing bids found")
         return bids[:8]
     except Exception as e:
         log.warning(f"{name}: {e}")
