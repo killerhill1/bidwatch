@@ -178,18 +178,19 @@ def scrape_samgov():
 
     from datetime import timedelta
     today     = datetime.now()
-    from_date = (today - timedelta(days=365)).strftime("%m/%d/%Y")
+    from_date = (today - timedelta(days=90)).strftime("%m/%d/%Y")
     to_date   = today.strftime("%m/%d/%Y")
 
-    # Search by keyword — catches bids regardless of NAICS code
-    for keyword in ["roofing", "roof replacement", "slate roof", "roof repair", "historic roof", "historic roofing", "slate roofing", "copper roofing"]:
+    # SAM.gov uses 'title' for keyword search, not 'keyword'
+    for term in ["roofing", "roof replacement", "slate roof", "roof repair",
+                 "historic roof", "historic roofing", "slate roofing", "copper roofing"]:
         try:
             params = {
                 "api_key":    api_key,
                 "limit":      25,
                 "postedFrom": from_date,
                 "postedTo":   to_date,
-                "keyword":    keyword,
+                "title":      term,
                 "active":     "true",
             }
             r = session.get(
@@ -197,14 +198,14 @@ def scrape_samgov():
                 params=params,
                 timeout=25
             )
-            log.info(f"SAM.gov '{keyword}': HTTP {r.status_code}")
+            log.info(f"SAM.gov '{term}': HTTP {r.status_code}")
             if not r.ok:
-                log.warning(f"SAM.gov error: {r.text[:300]}")
+                log.warning(f"SAM.gov error: {r.text[:200]}")
                 continue
             data  = r.json()
             total = data.get("totalRecords", 0)
             opps  = data.get("opportunitiesData") or []
-            log.info(f"SAM.gov '{keyword}': {total} total, {len(opps)} returned")
+            log.info(f"SAM.gov '{term}': {total} total, {len(opps)} returned")
 
             for o in opps:
                 bid_id = f"sam_{o.get('noticeId', abs(hash(o.get('title',''))))}"
@@ -223,7 +224,7 @@ def scrape_samgov():
                     "found":    datetime.now().isoformat()
                 })
         except Exception as e:
-            log.warning(f"SAM.gov '{keyword}': {e}")
+            log.warning(f"SAM.gov '{term}': {e}")
 
     log.info(f"SAM.gov total: {len(bids)} federal bids")
     return bids
