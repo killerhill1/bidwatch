@@ -192,6 +192,7 @@ def scrape_samgov():
                 "postedTo":   to_date,
                 "title":      term,
                 "active":     "true",
+                "state":      "CT,MA,RI,NH,NY",
             }
             r = session.get(
                 "https://api.sam.gov/prod/opportunities/v2/search",
