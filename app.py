@@ -1,6 +1,6 @@
 """
 BidWatch — Courtman Enterprises LLC
-v6: health-check safe startup, fixed CT Source parser, corrected town URLs
+v7: verified town URLs from uspublicworks.com directory
 """
 
 # ── Logging first ─────────────────────────────────────────────────────────────
@@ -13,7 +13,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 log = logging.getLogger("bidwatch")
-log.info("BidWatch v6 starting")
+log.info("BidWatch v7 starting")
 
 # ── Safe lxml fallback ────────────────────────────────────────────────────────
 try:
@@ -42,7 +42,6 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = DATA_DIR / "bids.json"
 SEEN_FILE = DATA_DIR / "seen.json"
 lock      = threading.Lock()
-log.info(f"Storage: {DATA_DIR}")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ROOFING_KEYWORDS = [
@@ -51,22 +50,55 @@ ROOFING_KEYWORDS = [
     "sheet metal", "soffit", "fascia", "historic roof", "re-roof"
 ]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-}
+# Rotate user agents to avoid 403 blocks
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+_ua_index = 0
 
-# Only towns confirmed working (200 response) from logs
+def get_headers():
+    global _ua_index
+    ua = USER_AGENTS[_ua_index % len(USER_AGENTS)]
+    _ua_index += 1
+    return {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+# Verified URLs from CT public works directory
 TOWNS = [
-    ("Meriden",     "https://www.meridenct.gov/business/bids-rfps/",   "City of Meriden"),
-    ("Enfield",     "https://www.enfield-ct.gov/Bids.aspx",            "Town of Enfield"),
-    ("Vernon",      "https://www.vernon-ct.gov/government/bids-and-contracts", "Town of Vernon"),
-    ("Bloomfield",  "https://www.bloomfieldct.gov/Bids.aspx",          "Town of Bloomfield"),
-    ("Middletown",  "https://www.middletownct.gov/Bids.aspx",          "City of Middletown"),
-    ("Bristol",     "https://www.bristolct.gov/Bids.aspx",             "City of Bristol"),
-    # Windsor redirects to Windsor CA — removed
-    # Below need correct URLs — will add back once verified
+    # Confirmed working in logs
+    ("Meriden",        "https://www.meridenct.gov/business/bids-rfps/",                         "City of Meriden"),
+    ("Enfield",        "https://www.enfield-ct.gov/Bids.aspx",                                  "Town of Enfield"),
+    ("Vernon",         "https://www.vernon-ct.gov/government/bids-and-contracts",               "Town of Vernon"),
+    ("Bloomfield",     "https://www.bloomfieldct.gov/Bids.aspx",                                "Town of Bloomfield"),
+    ("Middletown",     "https://www.middletownct.gov/Bids.aspx",                                "City of Middletown"),
+    ("Bristol",        "https://www.bristolct.gov/Bids.aspx",                                   "City of Bristol"),
+    # Fixed URLs from directory
+    ("Berlin",         "https://www.berlinct.gov/topic/subtopic.php?topicid=412&structureid=123", "Town of Berlin"),
+    ("Glastonbury",    "https://www.glastonburyct.gov/departments/department-directory-i-z/purchasing/bids-rfps", "Town of Glastonbury"),
+    ("Farmington",     "https://www.farmington-ct.org/departments/finance-purchasing/purchasing/bids", "Town of Farmington"),
+    ("Windsor Locks",  "https://www.windsorlocksct.org/government/departments/finance/purchasing", "Town of Windsor Locks"),
+    ("Southington",    "https://southington.org/bids",                                          "Town of Southington"),
+    ("Tolland",        "https://www.tolland.org/government/purchasing/bids",                    "Town of Tolland"),
+    ("New Britain",    "https://www.newbritainct.gov/government/bids-rfps",                     "City of New Britain"),
+    ("East Hartford",  "https://www.easthartfordct.gov/government/purchasing/bids",             "Town of East Hartford"),
+    ("Manchester",     "https://www.manchesterct.gov/government/departments/general-services/purchasing/bids", "Town of Manchester"),
+    ("Wethersfield",   "https://www.wethersfieldct.gov/content/398/410/559.aspx",              "Town of Wethersfield"),
+    ("Newington",      "https://www.newingtonct.gov/government/bids",                           "Town of Newington"),
+    ("Windsor",        "https://www.windsorct.org/Bids.aspx",                                   "Town of Windsor CT"),
+    ("Avon",           "https://www.avon-ct.gov/government/bids",                               "Town of Avon"),
+    ("Wallingford",    "https://www.wallingford.ct.us/government/departments/purchasing/",       "Town of Wallingford"),
+    ("Torrington",     "https://www.torringtonct.org/bids",                                     "City of Torrington"),
+    ("Granby",         "https://www.granby-ct.gov/Bids.aspx",                                   "Town of Granby"),
 ]
 
 # ── HTTP session ──────────────────────────────────────────────────────────────
@@ -120,67 +152,64 @@ def save_seen(seen):
         except Exception as e:
             log.error(f"save_seen: {e}")
 
+# ── Town scraper ──────────────────────────────────────────────────────────────
 # ── CT Source scraper ─────────────────────────────────────────────────────────
 def scrape_ctsource():
+    """
+    Search BizNet for roofing bids by scanning every cell in every row
+    for roofing keywords — no fixed column index assumptions.
+    """
     bids = []
     seen_ids = set()
     session = make_session()
 
-    # BizNet keyword search
-    for kw in ["roofing", "roof", "slate"]:
+    for kw in ["roofing", "roof", "slate", "shingle"]:
         try:
             r = session.get(
                 "https://www.biznet.ct.gov/SCP_Search/BidResults.aspx",
                 params={"TN": kw, "CT": "B"},
-                headers=HEADERS, timeout=25
+                headers=get_headers(), timeout=25
             )
             r.raise_for_status()
             soup = BeautifulSoup(r.text, HTML_PARSER)
-
-            # Log the raw table to debug column structure
             table = soup.find("table")
             if not table:
-                log.warning(f"CT Source '{kw}': no table found in response")
+                log.warning(f"CT Source '{kw}': no table in response")
                 continue
 
-            rows = table.find_all("tr")[1:]
-            log.info(f"CT Source '{kw}': {len(rows)} rows, first row cols: {[clean(td.get_text())[:30] for td in rows[0].find_all('td')] if rows else 'none'}")
-
-            for row in rows:
+            for row in table.find_all("tr")[1:]:
                 cols = row.find_all("td")
-                if len(cols) < 2:
+                if not cols:
                     continue
-                # Try every column for the title since we don't know the structure
+
+                # Search every cell for roofing keyword
                 title = ""
                 link  = "https://portal.ct.gov/DAS/CTSource/BidBoard"
+                org   = ""
+                deadline = ""
+
                 for i, col in enumerate(cols):
                     text = clean(col.get_text())
-                    if len(text) > 15 and is_roofing(text):
-                        title = text
+                    if not title and len(text) > 10 and is_roofing(text):
+                        title = text[:200]
                         a = col.find("a")
                         if a and a.get("href"):
                             href = a["href"]
                             link = href if href.startswith("http") else "https://www.biznet.ct.gov" + href
-                        break
 
-                if not title:
-                    continue
-
-                bid_id = f"ct_{abs(hash(title))}"
-                if bid_id in seen_ids:
-                    continue
-                seen_ids.add(bid_id)
-
-                # Get org and deadline from remaining cols
-                org      = clean(cols[2].get_text()) if len(cols) > 2 else "CT Agency"
-                deadline = clean(cols[3].get_text()) if len(cols) > 3 else ""
-
-                bids.append({
-                    "id": bid_id, "title": title[:200], "org": org,
-                    "source": "CT Source", "deadline": deadline,
-                    "value": None, "link": link, "status": "new",
-                    "found": datetime.now().isoformat()
-                })
+                # If we found a roofing title, grab org + deadline from other cols
+                if title:
+                    org      = clean(cols[2].get_text()) if len(cols) > 2 else "CT Agency"
+                    deadline = clean(cols[3].get_text()) if len(cols) > 3 else ""
+                    bid_id   = f"ct_{abs(hash(title + org))}"
+                    if bid_id not in seen_ids:
+                        seen_ids.add(bid_id)
+                        bids.append({
+                            "id": bid_id, "title": title, "org": org,
+                            "source": "CT Source", "deadline": deadline,
+                            "value": None, "link": link, "status": "new",
+                            "found": datetime.now().isoformat()
+                        })
 
         except Exception as e:
             log.warning(f"BizNet ({kw}): {e}")
@@ -188,13 +217,12 @@ def scrape_ctsource():
     log.info(f"CT Source: {len(bids)} roofing bids")
     return bids
 
-# ── Town scraper ──────────────────────────────────────────────────────────────
 def scrape_town(name, url, org):
     bids = []
     seen_ids = set()
     session = make_session()
     try:
-        r = session.get(url, headers=HEADERS, timeout=15)
+        r = session.get(url, headers=get_headers(), timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, HTML_PARSER)
         for tag in soup.find_all(["a", "li", "tr", "p", "div"]):
@@ -235,6 +263,7 @@ def run_scraper():
         fresh   = scrape_ctsource()
         for name, url, org in TOWNS:
             fresh += scrape_town(name, url, org)
+            time.sleep(0.5)  # Be polite — avoid triggering rate limits
         new_bids = [b for b in fresh if b["id"] not in seen]
         log.info(f"Scraped: {len(fresh)} total | {len(new_bids)} new")
         for b in fresh:
@@ -250,8 +279,6 @@ def run_scraper():
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-
-# Health check passes immediately — scraper starts AFTER first request
 _bg_started = False
 
 @app.before_request
@@ -259,7 +286,7 @@ def start_bg_once():
     global _bg_started
     if not _bg_started:
         _bg_started = True
-        log.info("First request received — starting background tasks")
+        log.info("First request — starting background tasks")
         def scheduler():
             schedule.every().day.at("06:00").do(run_scraper)
             schedule.every().day.at("18:00").do(run_scraper)
@@ -269,7 +296,6 @@ def start_bg_once():
         threading.Thread(target=run_scraper, daemon=True, name="scraper").start()
         threading.Thread(target=scheduler,   daemon=True, name="scheduler").start()
 
-# ── API ───────────────────────────────────────────────────────────────────────
 @app.route("/api/bids")
 def api_bids():
     return jsonify(load_bids())
@@ -430,7 +456,7 @@ td{padding:11px 14px;vertical-align:middle}
     <div class="stats">
       <div class="stat"><div class="slbl">Open Bids</div><div class="sval" id="st">-</div><div class="ssub">all sources</div></div>
       <div class="stat"><div class="slbl">Due This Week</div><div class="sval" style="color:var(--red)" id="su">-</div><div class="ssub">act fast</div></div>
-      <div class="stat"><div class="slbl">CT Source</div><div class="sval" style="color:var(--purple)" id="sct">-</div><div class="ssub">262 CT entities</div></div>
+      <div class="stat"><div class="slbl">CT Source</div><div class="sval" style="color:var(--purple)" id="sct">-</div><div class="ssub">register for alerts</div></div>
       <div class="stat"><div class="slbl">Town Pages</div><div class="sval" style="color:var(--green)" id="stw">-</div><div class="ssub">Hartford region</div></div>
     </div>
     <div class="toolbar">
@@ -456,7 +482,7 @@ td{padding:11px 14px;vertical-align:middle}
 </div>
 <div class="toast" id="toast"></div>
 <script>
-const TOWNS=['Hartford','West Hartford','East Hartford','Manchester','Meriden','Berlin','Glastonbury','Enfield','Wethersfield','Newington','Windsor','Bloomfield','Avon','Farmington','Windsor Locks','Southington','Vernon','Tolland','Middletown','Bristol','New Britain'];
+const TOWNS=['Meriden','Enfield','Vernon','Bloomfield','Middletown','Bristol','Berlin','Glastonbury','Farmington','Windsor Locks','Southington','Tolland','New Britain','East Hartford','Manchester','Wethersfield','Newington','Windsor','Avon','Wallingford','Torrington','Granby'];
 let bids=[],src='all',status='all',dl=null;
 document.getElementById('tlist').innerHTML=TOWNS.map(t=>`<div class="tc"><span class="dot"></span><span>${t}</span></div>`).join('');
 function du(d){if(!d)return null;try{return Math.ceil((new Date(d.slice(0,10))-new Date())/86400000)}catch{return null}}
@@ -554,7 +580,7 @@ load();setInterval(load,5*60*1000);
 </body>
 </html>"""
 
-log.info("App ready — waiting for first request")
+log.info("App ready")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
