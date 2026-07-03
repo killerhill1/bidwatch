@@ -60,45 +60,53 @@ USER_AGENTS = [
 ]
 _ua_index = 0
 
-def get_headers():
+def get_headers(referer=None):
     global _ua_index
     ua = USER_AGENTS[_ua_index % len(USER_AGENTS)]
     _ua_index += 1
-    return {
+    headers = {
         "User-Agent": ua,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
     }
+    if referer:
+        headers["Referer"] = referer
+    return headers
 
-# Verified URLs from CT public works directory
+# Verified URLs from uspublicworks.com CT directory + direct search
 TOWNS = [
-    # Confirmed working in logs
-    ("Meriden",        "https://www.meridenct.gov/business/bids-rfps/",                         "City of Meriden"),
-    ("Enfield",        "https://www.enfield-ct.gov/Bids.aspx",                                  "Town of Enfield"),
-    ("Vernon",         "https://www.vernon-ct.gov/government/bids-and-contracts",               "Town of Vernon"),
-    ("Bloomfield",     "https://www.bloomfieldct.gov/Bids.aspx",                                "Town of Bloomfield"),
-    ("Middletown",     "https://www.middletownct.gov/Bids.aspx",                                "City of Middletown"),
-    ("Bristol",        "https://www.bristolct.gov/Bids.aspx",                                   "City of Bristol"),
-    # Fixed URLs from directory
-    ("Berlin",         "https://www.berlinct.gov/topic/subtopic.php?topicid=412&structureid=123", "Town of Berlin"),
-    ("Glastonbury",    "https://www.glastonburyct.gov/departments/department-directory-i-z/purchasing/bids-rfps", "Town of Glastonbury"),
-    ("Farmington",     "https://www.farmington-ct.org/departments/finance-purchasing/purchasing/bids", "Town of Farmington"),
-    ("Windsor Locks",  "https://www.windsorlocksct.org/government/departments/finance/purchasing", "Town of Windsor Locks"),
-    ("Southington",    "https://southington.org/bids",                                          "Town of Southington"),
-    ("Tolland",        "https://www.tolland.org/government/purchasing/bids",                    "Town of Tolland"),
-    ("New Britain",    "https://www.newbritainct.gov/government/bids-rfps",                     "City of New Britain"),
-    ("East Hartford",  "https://www.easthartfordct.gov/government/purchasing/bids",             "Town of East Hartford"),
-    ("Manchester",     "https://www.manchesterct.gov/government/departments/general-services/purchasing/bids", "Town of Manchester"),
-    ("Wethersfield",   "https://www.wethersfieldct.gov/content/398/410/559.aspx",              "Town of Wethersfield"),
-    ("Newington",      "https://www.newingtonct.gov/government/bids",                           "Town of Newington"),
-    ("Windsor",        "https://www.windsorct.org/Bids.aspx",                                   "Town of Windsor CT"),
-    ("Avon",           "https://www.avon-ct.gov/government/bids",                               "Town of Avon"),
-    ("Wallingford",    "https://www.wallingford.ct.us/government/departments/purchasing/",       "Town of Wallingford"),
-    ("Torrington",     "https://www.torringtonct.org/bids",                                     "City of Torrington"),
-    ("Granby",         "https://www.granby-ct.gov/Bids.aspx",                                   "Town of Granby"),
+    # Confirmed working
+    ("Meriden",       "https://www.meridenct.gov/business/bids-rfps/",                "City of Meriden"),
+    ("Enfield",       "https://www.enfield-ct.gov/Bids.aspx",                         "Town of Enfield"),
+    ("Vernon",        "https://www.vernon-ct.gov/government/bids-and-contracts",      "Town of Vernon"),
+    ("Bloomfield",    "https://www.bloomfieldct.gov/Bids.aspx",                       "Town of Bloomfield"),
+    ("Middletown",    "https://www.middletownct.gov/Bids.aspx",                       "City of Middletown"),
+    ("Bristol",       "https://www.bristolct.gov/bids.aspx",                          "City of Bristol"),
+    # Verified from search
+    ("Newington",     "https://www.newingtonct.gov/Bids.aspx",                        "Town of Newington"),
+    ("Windsor",       "https://www.windsorct.gov/bids.aspx",                          "Town of Windsor"),
+    ("Wethersfield",  "https://www.wethersfieldct.gov/332/Current-Open-Bids",         "Town of Wethersfield"),
+    ("New Britain",   "https://www.newbritainct.gov/services/purchasing/bidshtm",     "City of New Britain"),
+    ("Southington",   "https://www.southingtonct.gov/departments/engineering_department/bid_invitations.php", "Town of Southington"),
+    ("Glastonbury",   "https://www.glastonburyct.gov/bids.aspx",                      "Town of Glastonbury"),
+    ("Farmington",    "https://www.farmington-ct.org/bids.aspx",                      "Town of Farmington"),
+    ("Tolland",       "https://www.tolland.org/Bids.aspx",                            "Town of Tolland"),
+    ("Windsor Locks", "https://www.windsorlocksct.org/Bids.aspx",                     "Town of Windsor Locks"),
+    ("Berlin",        "https://www.berlinct.gov/Bids.aspx",                           "Town of Berlin"),
+    ("East Hartford", "https://www.easthartfordct.gov/Bids.aspx",                     "Town of East Hartford"),
+    ("Manchester",    "https://www.manchesterct.gov/Bids.aspx",                       "Town of Manchester"),
+    ("Wallingford",   "https://www.wallingford.ct.us/Bids.aspx",                      "Town of Wallingford"),
+    ("Granby",        "https://www.granby-ct.gov/Bids.aspx",                          "Town of Granby"),
+    ("Cromwell",      "https://www.cromwellct.com/bids",                              "Town of Cromwell"),
+    ("Canton",        "https://www.townofcantonct.org/rfp-contracts",                 "Town of Canton"),
 ]
 
 # ── HTTP session ──────────────────────────────────────────────────────────────
@@ -168,7 +176,7 @@ def scrape_ctsource():
             r = session.get(
                 "https://www.biznet.ct.gov/SCP_Search/BidResults.aspx",
                 params={"TN": kw, "CT": "B"},
-                headers=get_headers(), timeout=25
+                headers=get_headers(referer="https://www.biznet.ct.gov/SCP_Search/Default.aspx"), timeout=25
             )
             r.raise_for_status()
             soup = BeautifulSoup(r.text, HTML_PARSER)
@@ -242,7 +250,11 @@ def scrape_town(name, url, org):
     seen_ids = set()
     session = make_session()
     try:
-        r = session.get(url, headers=get_headers(), timeout=15)
+        # Build referer from the town homepage to look like real navigation
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        homepage = f"{parsed.scheme}://{parsed.netloc}"
+        r = session.get(url, headers=get_headers(referer=homepage), timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, HTML_PARSER)
 
