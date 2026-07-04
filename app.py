@@ -91,10 +91,10 @@ TOWNS = [
     # User-verified URLs
     ("Farmington",    "https://www.farmington-ct.org/departments/finance-purchasing/purchasing/bids", "Town of Farmington"),
     ("Manchester",    "https://www.manchesterct.gov/Government/Departments/Purchasing/BIDS", "Town of Manchester"),
-    # Massachusetts cities — high roofing bid volume
-    ("Springfield MA",  "https://www.springfield-ma.gov/finance/procurement-bids/",              "City of Springfield MA"),
-    ("Worcester MA",    "https://www.worcesterma.gov/bids",                                       "City of Worcester MA"),
-    ("Providence RI",   "https://www.providenceri.gov/purchasing/bid-invitations/",               "City of Providence RI"),
+    # Massachusetts + Rhode Island cities
+    ("Springfield MA",  "https://www.springfield-ma.gov/finance/bids/",                                  "City of Springfield MA"),
+    ("Worcester MA",    "https://www.worcesterma.gov/finance/purchasing-bids/bids/open-bids",             "City of Worcester MA"),
+    ("Providence RI",   "https://www.providenceri.gov/purchasing/current-bids/",                          "City of Providence RI"),
 ]
 
 # ── Junk phrases to skip ──────────────────────────────────────────────────────
@@ -172,18 +172,65 @@ def scrape_samgov():
         log.warning("SAM_API_KEY not set — skipping federal bids")
         return []
 
-    bids = []
+    bids     = []
     seen_ids = set()
-    session = make_session()
+    session  = make_session()
 
     from datetime import timedelta
     today     = datetime.now()
     from_date = (today - timedelta(days=90)).strftime("%m/%d/%Y")
     to_date   = today.strftime("%m/%d/%Y")
 
-    # SAM.gov uses 'title' for keyword search, not 'keyword'
-    for term in ["roofing", "roof replacement", "slate roof", "roof repair",
-                 "historic roof", "historic roofing", "slate roofing", "copper roofing"]:
+    # Search 1 — NPS Northeast Region, NAICS 238160 (your saved search)
+    nps_searches = [
+        {"naicsCode": "238160", "organizationId": "100010512"},   # NPS Subtier
+        {"naicsCode": "238160", "organizationId": "100166820"},   # NER Northeast Region
+        {"naicsCode": "238160", "organizationId": "100182927"},   # NE Regional Contracting
+    ]
+    for s in nps_searches:
+        try:
+            params = {
+                "api_key":    api_key,
+                "limit":      25,
+                "postedFrom": from_date,
+                "postedTo":   to_date,
+                "naicsCode":  s["naicsCode"],
+                "organizationId": s["organizationId"],
+                "active":     "true",
+            }
+            r = session.get(
+                "https://api.sam.gov/prod/opportunities/v2/search",
+                params=params, timeout=25
+            )
+            if not r.ok:
+                log.warning(f"SAM.gov NPS {s['organizationId']}: {r.text[:200]}")
+                continue
+            data  = r.json()
+            total = data.get("totalRecords", 0)
+            opps  = data.get("opportunitiesData") or []
+            log.info(f"SAM.gov NPS org {s['organizationId']}: {total} total, {len(opps)} returned")
+            for o in opps:
+                bid_id = f"sam_{o.get('noticeId', abs(hash(o.get('title',''))))}"
+                if bid_id in seen_ids:
+                    continue
+                seen_ids.add(bid_id)
+                bids.append({
+                    "id":       bid_id,
+                    "title":    o.get("title", "Untitled")[:200],
+                    "org":      o.get("department") or o.get("subTier") or "Federal Agency",
+                    "source":   "Federal",
+                    "deadline": (o.get("responseDeadLine") or "")[:10],
+                    "value":    None,
+                    "link":     o.get("uiLink") or f"https://sam.gov/opp/{o.get('noticeId')}/view",
+                    "status":   "new",
+                    "found":    datetime.now().isoformat()
+                })
+        except Exception as e:
+            log.warning(f"SAM.gov NPS search: {e}")
+
+    # Search 2 — keyword search across CT/MA/RI/NH/NY for roofing terms
+    for term in ["roofing", "roof replacement", "slate roof", "historic roof",
+                 "historic roofing", "slate roofing", "copper roofing"]:
         try:
             params = {
                 "api_key":    api_key,
@@ -191,23 +238,20 @@ def scrape_samgov():
                 "postedFrom": from_date,
                 "postedTo":   to_date,
                 "title":      term,
-                "active":     "true",
                 "state":      "CT,MA,RI,NH,NY",
+                "active":     "true",
             }
             r = session.get(
                 "https://api.sam.gov/prod/opportunities/v2/search",
-                params=params,
-                timeout=25
+                params=params, timeout=25
             )
-            log.info(f"SAM.gov '{term}': HTTP {r.status_code}")
             if not r.ok:
-                log.warning(f"SAM.gov error: {r.text[:200]}")
+                log.warning(f"SAM.gov '{term}': {r.text[:200]}")
                 continue
             data  = r.json()
             total = data.get("totalRecords", 0)
             opps  = data.get("opportunitiesData") or []
             log.info(f"SAM.gov '{term}': {total} total, {len(opps)} returned")
-
             for o in opps:
                 bid_id = f"sam_{o.get('noticeId', abs(hash(o.get('title',''))))}"
                 if bid_id in seen_ids:
